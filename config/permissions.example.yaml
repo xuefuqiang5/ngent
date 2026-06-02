@@ -1,0 +1,5 @@
+# Phase 0 placeholder. Permission state machine is not implemented yet.
+version: 1
+default_mode: prompt
+rules: []
+

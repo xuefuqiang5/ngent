@@ -1,0 +1,8 @@
+phase = "phase0"
+ui_workspace = "ui/opentui-app"
+core_crate = "crates/netagent-core"
+
+[features]
+real_capture = false
+real_llm = false
+

@@ -1,0 +1,19 @@
+{
+  "name": "opentui-app",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/main.tsx",
+    "start": "bun run src/main.tsx"
+  },
+  "dependencies": {
+    "@opentui/core": "*",
+    "@opentui/react": "*",
+    "react": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/react": "^19.2.16"
+  }
+}
