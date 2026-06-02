@@ -1,79 +1,129 @@
 # NetAgent
 
-NetAgent is a permission-aware network monitoring and analysis TUI agent. It pairs an OpenTUI/Bun UI process with a Rust Core process over stdio JSON-RPC.
+> 终端版网络流量分析与安全检测 Agent —— 当前处于早期开发阶段，尚未完成。
 
-Current status: `Phase 7 - Parsing and First Finding`
+NetAgent 是一个权限感知的网络监控与分析 TUI 工具。它通过 OpenTUI + TypeScript/Bun 构建前端界面，Rust 构建后端核心，二者通过 stdio JSON-RPC 通信。
 
-## Completed phases
+**注意：项目仍在开发中，许多功能尚未实现或仅具备 mock 能力，请勿用于生产环境。**
 
-| Phase | Name | Status |
-|-------|------|--------|
-| 0 | Workspace Skeleton | Done |
-| 1 | Protocol and Harness | Done |
-| 2 | Agent Runtime Foundation | Done |
-| 3 | Permission State Machine | Done |
-| 4 | Tool Runtime and Artifact Store | Done |
-| 5 | UI Minimal Views | Done |
-| 6 | Real Capture MVP | Done |
-| 7 | Parsing and First Finding | Done |
+## 架构
 
-## Current capabilities
+```
+OpenTUI / TypeScript / Bun (UI)
+  └── Dashboard / Flows / Alerts / Agent Chat / Approval Modal
+        │
+        │ stdio JSON-RPC
+        │
+Rust Core
+  ├── JSON-RPC Server
+  ├── Agent Runtime
+  ├── Permission Manager (权限状态机)
+  ├── Tool Registry (工具执行)
+  ├── Capture Manager (tcpdump 抓包)
+  ├── Parser (tshark 解析 pcap)
+  ├── Analyzers (DNS 异常检测等)
+  ├── SQLite Storage
+  └── Artifact Store
+```
 
-- **Rust Core**: 18 JSON-RPC methods, real tcpdump capture path, tshark-based pcap parsing, SQLite persistence, NXDOMAIN spike detection, permission state machine, tool runtime with artifact refs.
-- **UI**: OpenTUI React dashboard with activity stream, alerts/findings panel, approval modal, agent prompt, and capture state fields.
+## 当前能力（Phase 7）
 
-## Workspace layout
+| 模块 | 状态 |
+|------|------|
+| JSON-RPC 通信 | 18 个方法可用 |
+| 权限状态机 | once / always / reject / reject_with_feedback |
+| tcpdump 抓包 | 已接入，需系统权限 |
+| tshark pcap 解析 | 已接入，提取 flow 和 DNS |
+| SQLite 持久化 | flows / dns_events / findings 三表 |
+| DNS NXDOMAIN 检测 | 已实现 |
+| OpenTUI 仪表盘 | 基础单屏界面 |
 
-- `crates/netagent-core`: Rust core process (JSON-RPC server, capture, parsing, storage, analysis)
-- `crates/netagent-models`: shared Rust data models (Flow, DnsEvent, Finding, EvidenceRef, etc.)
-- `ui/opentui-app`: Bun/OpenTUI UI workspace
-- `config/`: example configuration files
-- `rules/builtin/`: starter detection rules
-- `schemas/`: JSON schemas
-- `examples/`: example pcaps and configs
-- `tests/`: test fixtures
+## 快速开始
 
-## Development
+### 环境要求
 
-### Rust
+- Rust (nightly)
+- Bun
+- tshark (可选，pcap 解析需要)
+
+### 启动 Rust Core
 
 ```bash
-cargo check
-cargo test
 cargo run -p netagent-core
 ```
 
-### UI
+Core 启动后监听 stdin，接受 JSON-RPC 请求：
+
+```bash
+# 连通性检查
+printf '{"jsonrpc":"2.0","id":1,"method":"system.ping","params":{}}\n' | cargo run -q -p netagent-core
+
+# 查看能力列表
+printf '{"jsonrpc":"2.0","id":1,"method":"core.capabilities","params":{}}\n' | cargo run -q -p netagent-core
+
+# 解析 pcap 文件
+printf '{"jsonrpc":"2.0","id":1,"method":"pcap.open","params":{"path":"/path/to/file.pcap"}}\n' | cargo run -q -p netagent-core
+
+# 查看已存储的 flow
+printf '{"jsonrpc":"2.0","id":1,"method":"flow.list","params":{}}\n' | cargo run -q -p netagent-core
+
+# 运行 DNS 异常检测
+printf '{"jsonrpc":"2.0","id":1,"method":"dns.detect_anomalies","params":{"threshold_ratio":0.3}}\n' | cargo run -q -p netagent-core
+```
+
+### 启动 UI
 
 ```bash
 cd ui/opentui-app
 bun install
-bunx tsc --noEmit
-bun run src/main.ts
+bun run src/main.tsx
 ```
 
-### Quick verification
+## 项目结构
+
+```
+ngentv2/
+  crates/
+    netagent-core/     # Rust 核心进程
+    netagent-models/   # 共享数据模型
+  ui/opentui-app/      # OpenTUI 前端
+  config/              # 示例配置文件
+  rules/builtin/       # 检测规则
+  schemas/             # JSON Schema
+  examples/            # 示例 pcap 和配置
+  tests/               # 测试固件
+```
+
+## 开发
 
 ```bash
-# Ping
-printf '{"jsonrpc":"2.0","id":1,"method":"system.ping","params":{}}\n' | cargo run -q -p netagent-core
-
-# Capabilities
-printf '{"jsonrpc":"2.0","id":1,"method":"core.capabilities","params":{}}\n' | cargo run -q -p netagent-core
-
-# List stored flows
-printf '{"jsonrpc":"2.0","id":1,"method":"flow.list","params":{}}\n' | cargo run -q -p netagent-core
-
-# List stored findings
-printf '{"jsonrpc":"2.0","id":1,"method":"finding.list","params":{}}\n' | cargo run -q -p netagent-core
+cargo check           # 类型检查
+cargo test            # 运行测试
+cargo run -p netagent-core  # 启动核心
 ```
 
-## Known caveats
+## 已知限制
 
-- Live capture (`tcpdump`) requires permissions not available on this machine (`/dev/bpf0: Operation not permitted`).
-- End-to-end pcap parsing test requires a pcap file with DNS traffic; tshark is installed and ready.
-- Phase 7 compiles with zero warnings; Rust unit tests pass.
+- 实时抓包需要系统权限（macOS 下需配置 `/dev/bpf` 访问）
+- 端到端 pcap 解析未在本机完整验证
+- 报告生成、IOC 导出尚未实现（Phase 8）
+- UI 为基础单屏版本，交互有限
+- Agent 问答为 mock 实现，未接入真实 LLM
 
-## Next gate
+## 路线图
 
-`Phase 8: Reports` — Markdown report generation, IOC export, evidence bundle metadata.
+| Phase | 内容 | 状态 |
+|-------|------|------|
+| 0 | 项目骨架 | ✅ |
+| 1 | JSON-RPC 协议与 Harness | ✅ |
+| 2 | Agent Runtime | ✅ |
+| 3 | 权限状态机 | ✅ |
+| 4 | Tool Runtime 与 Artifact Store | ✅ |
+| 5 | UI 基本视图 | ✅ |
+| 6 | 真实抓包 (tcpdump) | ✅ |
+| 7 | pcap 解析与首个检测规则 | ✅ |
+| 8 | 报告生成 | 待开发 |
+
+## 许可证
+
+MIT
