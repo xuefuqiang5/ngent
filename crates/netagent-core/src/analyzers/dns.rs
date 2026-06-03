@@ -29,7 +29,10 @@ pub fn detect_nxdomain_spike(
         let evidence = vec![EvidenceRef {
             evidence_type: "dns_event".to_string(),
             id: format!("dns_stats_{host}"),
-            summary: format!("{nxdomain} NXDOMAIN responses out of {total} total DNS queries ({:.1}% ratio)", ratio * 100.0),
+            summary: format!(
+                "{nxdomain} NXDOMAIN responses out of {total} total DNS queries ({:.1}% ratio)",
+                ratio * 100.0
+            ),
         }];
 
         let finding = Finding {

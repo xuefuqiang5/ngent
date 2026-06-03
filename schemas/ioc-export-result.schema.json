@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://netagent.local/schemas/ioc-export-result.schema.json",
+  "title": "NetAgent ioc.export result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "artifact", "evidence_bundle", "counts"],
+  "properties": {
+    "status": {
+      "const": "ok"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "artifact": {
+      "$ref": "#/$defs/artifactRef"
+    },
+    "evidence_bundle": {
+      "$ref": "#/$defs/evidenceBundleMetadata"
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["findings", "flows", "dns_events", "artifacts"],
+      "properties": {
+        "findings": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "flows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dns_events": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "artifacts": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "$defs": {
+    "artifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "note", "path"],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": ["raw_tool_output", "summary", "pcap", "report", "ioc_export"]
+        },
+        "note": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "evidenceBundleMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "finding_count",
+        "flow_count",
+        "dns_event_count",
+        "artifact_count",
+        "pcap_artifact_count",
+        "evidence_ref_count",
+        "time_window_start",
+        "time_window_end"
+      ],
+      "properties": {
+        "finding_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "flow_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dns_event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "artifact_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pcap_artifact_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evidence_ref_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "time_window_start": {
+          "type": ["string", "null"]
+        },
+        "time_window_end": {
+          "type": ["string", "null"]
+        }
+      }
+    }
+  }
+}

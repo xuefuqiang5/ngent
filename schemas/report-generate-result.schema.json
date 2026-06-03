@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://netagent.local/schemas/report-generate-result.schema.json",
+  "title": "NetAgent report.generate result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "artifact", "metadata", "preview"],
+  "properties": {
+    "status": {
+      "const": "ok"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "artifact": {
+      "$ref": "#/$defs/artifactRef"
+    },
+    "metadata": {
+      "$ref": "#/$defs/evidenceBundleMetadata"
+    },
+    "preview": {
+      "type": "string",
+      "description": "Bounded Markdown preview. The full report is stored in the artifact."
+    }
+  },
+  "$defs": {
+    "artifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "note", "path"],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": ["raw_tool_output", "summary", "pcap", "report", "ioc_export"]
+        },
+        "note": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "evidenceBundleMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "finding_count",
+        "flow_count",
+        "dns_event_count",
+        "artifact_count",
+        "pcap_artifact_count",
+        "evidence_ref_count",
+        "time_window_start",
+        "time_window_end"
+      ],
+      "properties": {
+        "finding_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "flow_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dns_event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "artifact_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pcap_artifact_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evidence_ref_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "time_window_start": {
+          "type": ["string", "null"]
+        },
+        "time_window_end": {
+          "type": ["string", "null"]
+        }
+      }
+    }
+  }
+}

@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::Path;
 
-use netagent_models::{DnsEvent, Flow, Finding};
+use netagent_models::{DnsEvent, Finding, Flow};
 use rusqlite::{Connection, params};
 
 pub struct SqliteStore {
@@ -208,8 +208,7 @@ impl SqliteStore {
         let rows = stmt
             .query_map([], |row| {
                 let answers_str: String = row.get(8)?;
-                let answers: Vec<String> =
-                    serde_json::from_str(&answers_str).unwrap_or_default();
+                let answers: Vec<String> = serde_json::from_str(&answers_str).unwrap_or_default();
                 Ok(DnsEvent {
                     id: row.get(0)?,
                     timestamp: row.get(1)?,

@@ -6,6 +6,7 @@ dist/
 # Dev docs
 AGENTS.md
 HANDOFF.md
+handoff*.md
+HANDOFF*.md
 netagent_build_spec.md
 chat.txt
-

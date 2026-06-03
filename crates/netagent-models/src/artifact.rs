@@ -6,6 +6,8 @@ pub enum ArtifactKind {
     RawToolOutput,
     Summary,
     Pcap,
+    Report,
+    IocExport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

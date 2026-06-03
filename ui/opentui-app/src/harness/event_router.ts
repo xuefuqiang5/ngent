@@ -39,7 +39,12 @@ export class EventRouter {
       !method.startsWith("artifact.") &&
       !method.startsWith("finding.") &&
       !method.startsWith("capture.") &&
-      !method.startsWith("pcap.")
+      !method.startsWith("pcap.") &&
+      !method.startsWith("flow.") &&
+      !method.startsWith("dns.") &&
+      !method.startsWith("tls.") &&
+      !method.startsWith("http.") &&
+      !method.startsWith("report.")
     ) {
       return
     }
