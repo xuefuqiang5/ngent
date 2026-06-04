@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
+import type { KeyEvent } from "@opentui/core"
 import { useKeyboard, useRenderer } from "@opentui/react"
 import type { CoreEvent } from "../harness/event_router"
 import type { RpcClient } from "../harness/rpc_client"
@@ -22,12 +23,6 @@ type AppProps = {
   rpc: RpcClient
   transport: StdioTransport
 }
-
-const PROMPTS = [
-  "Summarize the current mock network posture.",
-  "Focus on top DNS talkers and protocol mix.",
-  "Explain the latest finding and point to evidence.",
-]
 
 export function App({ eventRouter, rpc, transport }: AppProps) {
   const renderer = useRenderer()
@@ -57,16 +52,38 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
   useKeyboard((event) => {
     if (event.eventType === "release") return
 
-    if (event.name === "q" || event.name === "escape") {
+    if (event.name === "escape" || (event.ctrl && event.name === "c")) {
       renderer.destroy()
       return
     }
 
-    if (event.name === "tab") {
-      setState((current: UiState) => ({
-        ...current,
-        selectedPromptIndex: (current.selectedPromptIndex + 1) % PROMPTS.length,
-      }))
+    if (event.ctrl && event.name === "x") {
+      void stopCapture()
+      return
+    }
+
+    if (event.ctrl && event.name === "r") {
+      void hydrate()
+      return
+    }
+
+    if (state.pending.length > 0 && event.name === "y") {
+      void replyToPermission("once")
+      return
+    }
+
+    if (state.pending.length > 0 && event.name === "a") {
+      void replyToPermission("always")
+      return
+    }
+
+    if (state.pending.length > 0 && event.name === "n") {
+      void replyToPermission("reject")
+      return
+    }
+
+    if (state.pending.length > 0 && event.name === "f") {
+      void replyToPermission("reject_with_feedback")
       return
     }
 
@@ -75,98 +92,125 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
       return
     }
 
-    if (event.name === "c") {
-      void requestCapture()
-      return
-    }
+    setState((current: UiState) => ({
+      ...current,
+      chatInput: applyChatInputKey(current.chatInput, event),
+    }))
+  })
 
-    if (event.name === "x") {
-      void stopCapture()
-      return
-    }
-
-    if (event.name === "r") {
-      void hydrate()
-      return
-    }
-
-    if (event.name === "y") {
-      void replyToPermission("once")
-      return
-    }
-
-    if (event.name === "a") {
-      void replyToPermission("always")
-      return
-    }
-
-    if (event.name === "n") {
-      void replyToPermission("reject")
-      return
-    }
-
-    if (event.name === "f") {
-      void replyToPermission("reject_with_feedback")
-    }
-  }, { release: true })
-
-  const selectedPrompt = PROMPTS[state.selectedPromptIndex] ?? PROMPTS[0]
-  const recentEvents = useMemo(() => state.events.slice(-10).reverse(), [state.events])
+  const recentEvents = useMemo(() => state.events.slice(-8).reverse(), [state.events])
+  const recentMessages = useMemo(
+    () => state.chatMessages.slice(-8),
+    [state.chatMessages],
+  )
   const findings = useMemo(() => state.alerts.slice(-4).reverse(), [state.alerts])
 
   async function hydrate(): Promise<void> {
     setState((current: UiState) => ({ ...current, loading: true, mode: "syncing" }))
 
-    const [capabilities, interfaces, pending] = await Promise.all([
-      rpc.request("core.capabilities"),
-      rpc.request("system.list_interfaces"),
-      rpc.request("permission.list_pending"),
-    ])
-    const captureStatus = await rpc.request("capture.status")
+    try {
+      const [capabilities, interfaces, pending] = await Promise.all([
+        rpc.request("core.capabilities"),
+        rpc.request("system.list_interfaces"),
+        rpc.request("permission.list_pending"),
+      ])
+      const captureStatus = await rpc.request("capture.status")
 
-    setState((current: UiState) => ({
-      ...current,
-      loading: false,
-      mode: current.pending.length > 0 ? "approval" : "dashboard",
-      snapshot: buildSnapshot(capabilities, interfaces, captureStatus),
-      pending: readPending(pending),
-    }))
+      setState((current: UiState) => ({
+        ...current,
+        loading: false,
+        mode: readPending(pending).length > 0 ? "approval" : "dashboard",
+        snapshot: buildSnapshot(capabilities, interfaces, captureStatus),
+        pending: readPending(pending),
+        chatMessages: markSystemMessage(
+          current.chatMessages,
+          "Core connected. Continue the session or ask a new question.",
+        ),
+      }))
+    } catch (error) {
+      setState((current: UiState) => ({
+        ...current,
+        loading: false,
+        mode: "agent",
+        chatMessages: [
+          ...current.chatMessages,
+          {
+            id: nextUiId("chat_error"),
+            role: "system",
+            status: "error",
+            content: error instanceof Error ? error.message : String(error),
+          },
+        ],
+      }))
+    }
   }
 
   async function sendAgentPrompt(): Promise<void> {
+    const prompt = state.chatInput.trim()
+    if (!prompt || state.loading) return
+
+    const userMessageId = nextUiId("chat_user")
     setState((current: UiState) => ({
       ...current,
       mode: "agent",
       loading: true,
-      lastPrompt: selectedPrompt,
+      chatInput: "",
+      lastPrompt: prompt,
+      chatMessages: [
+        ...current.chatMessages,
+        {
+          id: userMessageId,
+          role: "user",
+          status: "sent",
+          content: prompt,
+        },
+      ],
     }))
-    const result = await rpc.request("agent.ask", { input: selectedPrompt })
 
-    setState((current: UiState) => ({
-      ...current,
-      loading: false,
-      mode: current.pending.length > 0 ? "approval" : "agent",
-      lastAgentResult: JSON.stringify(result),
-    }))
-  }
+    try {
+      const result = await rpc.request("agent.ask", {
+        session_id: state.sessionId === "n/a" ? undefined : state.sessionId,
+        input: prompt,
+      })
+      const response = result as {
+        session?: { id?: string }
+        assistant_message?: { id?: string; parts?: Array<{ content?: string }> }
+      }
+      const assistantText = response.assistant_message?.parts?.[0]?.content
 
-  async function requestCapture(): Promise<void> {
-    setState((current: UiState) => ({ ...current, loading: true, mode: "approval" }))
-    await rpc.request("capture.start", {
-      session_id: "ses_ui_capture",
-      interface: "mock1",
-      filter: "tcp or dns",
-      duration: 30,
-    })
-
-    const pending = await rpc.request("permission.list_pending")
-    setState((current: UiState) => ({
-      ...current,
-      loading: false,
-      mode: "approval",
-      pending: readPending(pending),
-    }))
-    await refreshCaptureStatus()
+      setState((current: UiState) => ({
+        ...current,
+        loading: false,
+        mode: current.pending.length > 0 ? "approval" : "agent",
+        sessionId: response.session?.id ?? current.sessionId,
+        lastAgentResult: assistantText ?? JSON.stringify(result),
+        chatMessages: [
+          ...current.chatMessages,
+          {
+            id: response.assistant_message?.id ?? nextUiId("chat_assistant"),
+            role: "assistant",
+            status: "sent",
+            content: assistantText ?? JSON.stringify(result),
+          },
+        ],
+      }))
+    } catch (error) {
+      setState((current: UiState) => ({
+        ...current,
+        loading: false,
+        mode: "agent",
+        chatInput: prompt,
+        chatMessages: [
+          ...current.chatMessages,
+          {
+            id: nextUiId("chat_error"),
+            role: "assistant",
+            status: "error",
+            content: error instanceof Error ? error.message : String(error),
+          },
+        ],
+      }))
+    }
   }
 
   async function stopCapture(): Promise<void> {
@@ -248,6 +292,7 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
           <PanelLine label="Capture" value={state.snapshot.captureStatus} />
           <PanelLine label="CaptureId" value={state.snapshot.captureId} />
           <PanelLine label="Interface" value={state.snapshot.captureInterface} />
+          <PanelLine label="Session" value={state.sessionId} />
           <PanelLine label="Pending" value={String(state.pending.length)} />
           <PanelLine label="Findings" value={String(state.alerts.length)} />
 
@@ -294,11 +339,28 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
             gap={1}
           >
             <text fg="#cbd5e1">Agent Chat</text>
-            <text fg="#94a3b8">{selectedPrompt}</text>
+            <box flexDirection="column" gap={1}>
+              {recentMessages.map((message) => (
+                <box key={message.id} flexDirection="column">
+                  <text fg={chatRoleColor(message.role, message.status)}>
+                    {chatRoleLabel(message.role, message.status)}
+                  </text>
+                  <text fg="#e2e8f0">{truncate(message.content, 320)}</text>
+                </box>
+              ))}
+            </box>
+            <box
+              borderStyle="single"
+              borderColor={state.loading ? "#facc15" : "#0f766e"}
+              padding={1}
+            >
+              <text fg={state.chatInput ? "#e2e8f0" : "#64748b"}>
+                {state.chatInput || "Ask NetAgent..."}
+              </text>
+            </box>
             <text fg="#64748b">
-              Enter send | Tab cycle prompt | c request capture | x stop capture | y/a/n/f reply approval | q quit
+              Enter send | Backspace edit | Ctrl+X stop capture | Ctrl+R refresh | Esc quit
             </text>
-            <text fg="#e2e8f0">{truncate(state.lastAgentResult, 220)}</text>
           </box>
         </box>
       </box>
@@ -315,6 +377,63 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
       </box>
     )
   }
+}
+
+export function applyChatInputKey(value: string, event: KeyEvent): string {
+  if (event.ctrl || event.meta) return value
+  if (event.name === "backspace") return value.slice(0, -1)
+  if (event.name === "delete") return value.slice(0, -1)
+  if (event.name === "space") return `${value} `
+  if (event.name === "tab") return `${value}  `
+  if (event.name.length === 1) {
+    return `${value}${event.shift ? event.name.toUpperCase() : event.name}`
+  }
+
+  const sequence = event.sequence ?? ""
+  if (sequence.length > 0 && !sequence.startsWith("\u001b") && sequence >= " ") {
+    return `${value}${sequence}`
+  }
+  return value
+}
+
+function markSystemMessage(messages: UiState["chatMessages"], content: string) {
+  const [first, ...rest] = messages
+  if (first?.role !== "system") {
+    return [
+      {
+        id: "chat_system_0001",
+        role: "system" as const,
+        status: "sent" as const,
+        content,
+      },
+      ...messages,
+    ]
+  }
+  return [{ ...first, status: "sent" as const, content }, ...rest]
+}
+
+function chatRoleLabel(
+  role: "user" | "assistant" | "system",
+  status: "sending" | "sent" | "error",
+): string {
+  if (status === "error") return `${role} error`
+  if (role === "user") return "you"
+  if (role === "assistant") return "netagent"
+  return "system"
+}
+
+function chatRoleColor(
+  role: "user" | "assistant" | "system",
+  status: "sending" | "sent" | "error",
+): string {
+  if (status === "error") return "#f97316"
+  if (role === "user") return "#38bdf8"
+  if (role === "assistant") return "#34d399"
+  return "#94a3b8"
+}
+
+function nextUiId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${Math.floor(Math.random() * 10000)}`
 }
 
 function buildSnapshot(
@@ -362,7 +481,7 @@ function readPending(payload: unknown): PendingApproval[] {
   return pending ?? []
 }
 
-function reduceEvent(current: UiState, event: CoreEvent): UiState {
+export function reduceEvent(current: UiState, event: CoreEvent): UiState {
   const next = { ...current, events: [...current.events, event] }
 
   if (event.method === "permission.asked") {
@@ -389,7 +508,10 @@ function reduceEvent(current: UiState, event: CoreEvent): UiState {
     const finding = normalizeFinding(event.params)
     return {
       ...next,
-      alerts: [...current.alerts, finding],
+      alerts: [
+        ...current.alerts.filter((item) => item.id !== finding.id),
+        finding,
+      ],
     }
   }
 
@@ -422,19 +544,23 @@ function reduceEvent(current: UiState, event: CoreEvent): UiState {
   return next
 }
 
-function normalizeFinding(payload: unknown): AlertItem {
-  const finding = payload as {
+export function normalizeFinding(payload: unknown): AlertItem {
+  const envelope = payload as {
+    finding?: unknown
+  }
+  const finding = (envelope.finding ?? payload) as {
     id?: string
     severity?: string
     title?: string
     summary?: string
+    description?: string
   }
 
   return {
     id: finding.id ?? `finding-${Date.now()}`,
     severity: finding.severity ?? "low",
     title: finding.title ?? "Unknown finding",
-    summary: finding.summary ?? "No summary",
+    summary: finding.summary ?? finding.description ?? "No summary",
   }
 }
 

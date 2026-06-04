@@ -35,11 +35,21 @@ export type AlertItem = {
   summary: string
 }
 
+export type ChatMessage = {
+  id: string
+  role: "user" | "assistant" | "system"
+  status: "sending" | "sent" | "error"
+  content: string
+}
+
 export type UiState = {
   mode: UiMode
   loading: boolean
   selectedPromptIndex: number
   snapshot: DashboardSnapshot
+  sessionId: string
+  chatInput: string
+  chatMessages: ChatMessage[]
   pending: PendingApproval[]
   alerts: AlertItem[]
   events: Array<{ method: string; params: unknown }>
@@ -62,6 +72,16 @@ export function initialState(): UiState {
       captureId: "n/a",
       captureInterface: "n/a",
     },
+    sessionId: "n/a",
+    chatInput: "",
+    chatMessages: [
+      {
+        id: "chat_system_0001",
+        role: "system",
+        status: "sent",
+        content: "Core is starting. Type a question and press Enter.",
+      },
+    ],
     pending: [],
     alerts: [],
     events: [],

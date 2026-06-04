@@ -4,5 +4,17 @@ core_crate = "crates/netagent-core"
 
 [features]
 real_capture = false
-real_llm = false
+real_llm = true
 
+[llm]
+provider = "openai_compatible"
+api_base = "https://api.openai.com/v1"
+model = "gpt-4.1-mini"
+timeout_secs = 60
+
+# Runtime reads these from environment:
+# NETAGENT_LLM_API_KEY
+# NETAGENT_LLM_API_BASE
+# NETAGENT_LLM_MODEL
+# NETAGENT_LLM_TIMEOUT_SECS
+# NETAGENT_LLM_SYSTEM_PROMPT

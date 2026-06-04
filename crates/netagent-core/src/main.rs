@@ -14,13 +14,13 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::analyzers::dns::detect_nxdomain_spike;
-use crate::core::agent::{MockAgentRun, MockAgentRuntime};
+use crate::core::agent::{AgentAskInput, AgentRuntime, AgentTurn};
 use crate::core::permissions::{PermissionManager, PermissionOutcome};
 use crate::reports::markdown::{
     EvidenceBundleMetadata, MarkdownReportInput, build_evidence_bundle_metadata,
     build_markdown_report,
 };
-use crate::runtime::tool_registry::{ToolContext, ToolRegistry, ToolResult};
+use crate::runtime::tool_registry::{ToolContext, ToolRegistry};
 use crate::storage::artifact_store::ArtifactStore;
 use crate::storage::sqlite::SqliteStore;
 use crate::tools::tshark;
@@ -69,7 +69,7 @@ struct RpcError {
 
 #[derive(Debug)]
 struct CoreState {
-    agent_runtime: MockAgentRuntime,
+    agent_runtime: AgentRuntime,
     permission_manager: PermissionManager,
     tool_registry: ToolRegistry,
     artifact_store: ArtifactStore,
@@ -103,6 +103,14 @@ struct CaptureJob {
     child: Child,
 }
 
+#[derive(Debug, Clone)]
+struct AgentCapturePlan {
+    interface: String,
+    filter: String,
+    duration_secs: u64,
+    reason: String,
+}
+
 #[derive(Debug, Serialize)]
 struct IocExportDocument {
     generated_at: String,
@@ -132,7 +140,7 @@ fn run() -> io::Result<()> {
         SqliteStore::open(&db_path).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     let mut state = CoreState {
-        agent_runtime: MockAgentRuntime::default(),
+        agent_runtime: AgentRuntime::from_env(),
         permission_manager: PermissionManager::default(),
         tool_registry: ToolRegistry,
         artifact_store: ArtifactStore::default(),
@@ -151,9 +159,9 @@ fn run() -> io::Result<()> {
             jsonrpc: JSON_RPC_VERSION,
             method: "event.core.ready",
             params: json!({
-                "phase": "phase8",
+                "phase": "phase9",
                 "protocol_version": JSON_RPC_VERSION,
-                "message": "NetAgent core ready — Phase 8 reports and export."
+                "message": "NetAgent core ready — Phase 9 agent chat and LLM integration."
             }),
         },
     )?;
@@ -206,12 +214,12 @@ fn handle_request<W: Write>(
     let result = match request.method.as_str() {
         "system.ping" => Ok(json!({
             "ok": true,
-            "phase": "phase8",
+            "phase": "phase9",
             "message": "pong"
         })),
         "core.capabilities" => Ok(json!({
             "protocol_version": JSON_RPC_VERSION,
-            "phase": "phase8",
+            "phase": "phase9",
             "methods": [
                 "system.ping",
                 "core.capabilities",
@@ -255,9 +263,10 @@ fn handle_request<W: Write>(
                 "pcap.created",
                 "report.generated"
             ],
+            "llm": state.agent_runtime.llm_status(),
             "limits": {
                 "high_frequency_packet_events": false,
-                "max_steps": 4
+                "max_steps": 8
             }
         })),
         "system.list_interfaces" => Ok(json!({
@@ -281,24 +290,61 @@ fn handle_request<W: Write>(
                 .params
                 .get("input")
                 .and_then(Value::as_str)
-                .unwrap_or("Describe current network state.");
+                .unwrap_or("Describe current network state.")
+                .to_string();
+            let session_id = request
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let context_summary = build_agent_context_summary(state);
+            let capture_plan = build_agent_capture_plan(state, &input);
 
-            let run = state.agent_runtime.run_mock_turn(input);
-            let tool_result = match execute_mock_large_output_tool(state, writer, &run, input) {
-                Ok(result) => result,
-                Err(error) => return Ok(error_response(request.id, error)),
+            let turn = match state.agent_runtime.run_turn(AgentAskInput {
+                session_id,
+                mode: AgentMode::Observe,
+                input,
+                context_summary,
+                capture_recommendation: capture_plan
+                    .as_ref()
+                    .map(agent_capture_recommendation_text),
+            }) {
+                Ok(turn) => turn,
+                Err(message) => {
+                    return Ok(error_response(
+                        request.id,
+                        RpcError {
+                            code: -32010,
+                            message,
+                        },
+                    ));
+                }
             };
-            emit_agent_run_events(writer, &run, &tool_result)?;
 
-            Ok(MockAgentRuntime::build_agent_response_with_tool_result(
-                &run,
-                &tool_result,
-            ))
+            emit_agent_turn_events(writer, &turn)?;
+            let mut result = AgentRuntime::build_agent_response(&turn);
+            if let Some(plan) = capture_plan {
+                let proposal = match request_capture_permission(
+                    state,
+                    writer,
+                    &turn.session_finished.id,
+                    &plan.interface,
+                    &plan.filter,
+                    plan.duration_secs,
+                    &plan.reason,
+                    &turn.assistant_message.id,
+                ) {
+                    Ok(proposal) => proposal,
+                    Err(error) => return Ok(error_response(request.id, error)),
+                };
+                result["capture_proposal"] = proposal;
+            }
+            Ok(result)
         }
         "agent.abort" => Ok(json!({
             "aborted": false,
             "run_state": RunState::Idle,
-            "message": "No long-running mock step is active in Phase 6."
+            "message": "No long-running agent step is active in Phase 9."
         })),
         "capture.start" => handle_capture_start(state, writer, &request.params),
         "capture.status" => handle_capture_status(state),
@@ -348,34 +394,32 @@ fn error_response(id: Value, error: RpcError) -> RpcResponse {
     }
 }
 
-fn emit_agent_run_events<W: Write>(
-    writer: &mut W,
-    run: &MockAgentRun,
-    tool_result: &ToolResult,
-) -> io::Result<()> {
+fn emit_agent_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::Result<()> {
+    if turn.session_created {
+        emit_event(
+            writer,
+            "session.created",
+            json!({ "session": turn.session_started }),
+        )?;
+    }
     emit_event(
         writer,
-        "session.created",
-        json!({ "session": run.session_started }),
+        "message.created",
+        json!({ "message": turn.user_message }),
     )?;
     emit_event(
         writer,
         "message.created",
-        json!({ "message": run.user_message }),
-    )?;
-    emit_event(
-        writer,
-        "message.created",
-        json!({ "message": run.assistant_message }),
+        json!({ "message": turn.assistant_message }),
     )?;
     emit_event(
         writer,
         "agent.step.started",
         json!({
             "step": {
-                "id": run.step.id,
-                "session_id": run.step.session_id,
-                "attempt": run.step.attempt,
+                "id": turn.step.id,
+                "session_id": turn.step.session_id,
+                "attempt": turn.step.attempt,
                 "status": StepStatus::Running,
             }
         }),
@@ -384,122 +428,43 @@ fn emit_agent_run_events<W: Write>(
         writer,
         "agent.text.started",
         json!({
-            "session_id": run.session_started.id,
-            "message_id": run.assistant_message.id,
-            "part_id": run.assistant_message.parts[0].id,
+            "session_id": turn.session_started.id,
+            "message_id": turn.assistant_message.id,
+            "part_id": turn.assistant_message.parts[0].id,
         }),
     )?;
     emit_event(
         writer,
         "agent.text.delta",
         json!({
-            "session_id": run.session_started.id,
-            "message_id": run.assistant_message.id,
-            "part_id": run.assistant_message.parts[0].id,
-            "delta": run.assistant_message.parts[0].content,
+            "session_id": turn.session_started.id,
+            "message_id": turn.assistant_message.id,
+            "part_id": turn.assistant_message.parts[0].id,
+            "delta": turn.assistant_message.parts[0].content,
         }),
     )?;
     emit_event(
         writer,
         "agent.text.ended",
         json!({
-            "session_id": run.session_started.id,
-            "message_id": run.assistant_message.id,
-            "part_id": run.assistant_message.parts[0].id,
-        }),
-    )?;
-    emit_event(
-        writer,
-        "agent.tool.called",
-        json!({
-            "tool_call": {
-                "id": run.tool_call.id,
-                "session_id": run.tool_call.session_id,
-                "step_id": run.tool_call.step_id,
-                "tool_name": run.tool_call.tool_name,
-                "input": run.tool_call.input,
-                "status": ToolCallStatus::Pending,
-            }
-        }),
-    )?;
-    emit_event(
-        writer,
-        "agent.tool.success",
-        json!({
-            "tool_call": run.tool_call,
-            "summary": tool_result.summary,
-            "tool_result": tool_result,
-        }),
-    )?;
-    emit_event(
-        writer,
-        "finding.created",
-        json!({
-            "id": "finding_mock_0001",
-            "severity": "low",
-            "title": "Large tool output truncated",
-            "summary": "Assistant response uses artifact refs instead of raw tool output.",
-            "evidence": tool_result.artifacts,
+            "session_id": turn.session_started.id,
+            "message_id": turn.assistant_message.id,
+            "part_id": turn.assistant_message.parts[0].id,
         }),
     )?;
     emit_event(
         writer,
         "agent.step.ended",
         json!({
-            "step": run.step,
-            "run_state": run.final_run_state,
-            "phase": "phase8",
+            "step": turn.step,
+            "run_state": turn.final_run_state,
+            "phase": "phase9",
+            "llm": {
+                "used": turn.llm_used,
+                "model": turn.llm_model,
+            }
         }),
     )
-}
-
-fn execute_mock_large_output_tool<W: Write>(
-    state: &mut CoreState,
-    writer: &mut W,
-    run: &MockAgentRun,
-    query: &str,
-) -> Result<ToolResult, RpcError> {
-    let context = ToolContext {
-        session_id: run.session_started.id.clone(),
-        message_id: run.assistant_message.id.clone(),
-        call_id: run.tool_call.id.clone(),
-        agent: AgentMode::Observe,
-        abort: false,
-    };
-    let (tool_result, progress) =
-        state
-            .tool_registry
-            .run_mock_large_output(&context, query, &mut state.artifact_store);
-
-    for update in progress {
-        emit_event(
-            writer,
-            "agent.tool.progress",
-            json!({
-                "tool_call_id": update.tool_call_id,
-                "status": update.status,
-                "message": update.message,
-            }),
-        )
-        .map_err(|error| RpcError {
-            code: -32001,
-            message: format!("failed to emit tool progress: {error}"),
-        })?;
-    }
-
-    if let Some(raw_output_artifact) = &tool_result.raw_output_artifact {
-        emit_event(
-            writer,
-            "artifact.created",
-            json!({ "artifact": raw_output_artifact }),
-        )
-        .map_err(|error| RpcError {
-            code: -32001,
-            message: format!("failed to emit artifact.created: {error}"),
-        })?;
-    }
-
-    Ok(tool_result)
 }
 
 fn handle_tool_mock_large_output<W: Write>(
@@ -594,6 +559,78 @@ fn emit_event<W: Write>(writer: &mut W, method: &str, params: Value) -> io::Resu
     )
 }
 
+fn build_agent_context_summary(state: &CoreState) -> String {
+    let flow_count = state.sqlite_store.flow_count().unwrap_or(0);
+    let dns_count = state
+        .sqlite_store
+        .list_dns_events()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let finding_count = state
+        .sqlite_store
+        .list_findings()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let artifact_count = state.artifact_store.list_artifacts().len();
+    let capture_status = match &state.capture_job {
+        Some(job) => format!(
+            "running capture {} on {} with filter {}",
+            job.id, job.interface, job.filter
+        ),
+        None => String::from("no active live capture"),
+    };
+
+    format!(
+        "flows={flow_count}\ndns_events={dns_count}\nfindings={finding_count}\nartifacts={artifact_count}\ncapture_status={capture_status}"
+    )
+}
+
+fn build_agent_capture_plan(state: &CoreState, input: &str) -> Option<AgentCapturePlan> {
+    if state.capture_job.is_some() || state.pending_capture.is_some() {
+        return None;
+    }
+
+    let lower = input.to_lowercase();
+    if lower.contains("stop capture")
+        || lower.contains("停止抓包")
+        || lower.contains("不要抓包")
+        || lower.contains("不用抓包")
+    {
+        return None;
+    }
+
+    let wants_live_evidence = lower.contains("抓包")
+        || lower.contains("capture")
+        || lower.contains("packet")
+        || lower.contains("live")
+        || lower.contains("实时")
+        || lower.contains("当前网络")
+        || lower.contains("现在网络")
+        || lower.contains("流量")
+        || lower.contains("可疑")
+        || lower.contains("异常");
+
+    if !wants_live_evidence {
+        return None;
+    }
+
+    Some(AgentCapturePlan {
+        interface: String::from("mock1"),
+        filter: String::from("tcp or dns"),
+        duration_secs: 10,
+        reason: String::from(
+            "The request needs fresh live network evidence. NetAgent proposes a short bounded capture before making stronger claims.",
+        ),
+    })
+}
+
+fn agent_capture_recommendation_text(plan: &AgentCapturePlan) -> String {
+    format!(
+        "I recommend requesting user approval for a bounded live capture: interface={}, filter={}, duration={}s. Reason: {}",
+        plan.interface, plan.filter, plan.duration_secs, plan.reason
+    )
+}
+
 fn handle_capture_start<W: Write>(
     state: &mut CoreState,
     writer: &mut W,
@@ -614,6 +651,28 @@ fn handle_capture_start<W: Write>(
         .unwrap_or("ses_capture_0001");
     let duration = duration.clamp(1, 10);
 
+    request_capture_permission(
+        state,
+        writer,
+        session_id,
+        interface,
+        filter,
+        duration,
+        &format!("Capture live packets from interface {interface}"),
+        "msg_capture_0001",
+    )
+}
+
+fn request_capture_permission<W: Write>(
+    state: &mut CoreState,
+    writer: &mut W,
+    session_id: &str,
+    interface: &str,
+    filter: &str,
+    duration: u64,
+    reason: &str,
+    message_id: &str,
+) -> Result<Value, RpcError> {
     let request = PermissionRequest {
         id: next_counter_id("per", &mut state.permission_counter),
         session_id: session_id.to_string(),
@@ -629,10 +688,10 @@ fn handle_capture_start<W: Write>(
             command_preview: format!(
                 "mock tcpdump -i {interface} -nn -s 0 -w capture-{interface}.pcap {filter}"
             ),
-            reason: format!("Capture live packets from interface {interface}"),
+            reason: reason.to_string(),
         },
         tool: ToolRef {
-            message_id: String::from("msg_capture_0001"),
+            message_id: message_id.to_string(),
             call_id: next_counter_id("call", &mut state.capture_counter),
         },
     };
@@ -1626,7 +1685,7 @@ mod tests {
 
     fn test_core_state(db_path: &PathBuf) -> CoreState {
         CoreState {
-            agent_runtime: MockAgentRuntime::default(),
+            agent_runtime: AgentRuntime::disabled(),
             permission_manager: PermissionManager::default(),
             tool_registry: ToolRegistry,
             artifact_store: ArtifactStore::default(),
@@ -1993,5 +2052,75 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(pcap_path);
+    }
+
+    #[test]
+    fn agent_ask_creates_session_and_reuses_it_when_session_id_is_provided() {
+        let db_path = temp_db_path("phase9-agent-session");
+        let mut state = test_core_state(&db_path);
+
+        let (first, first_events) = call_rpc(
+            &mut state,
+            1,
+            "agent.ask",
+            json!({ "input": "Summarize current state." }),
+        );
+        let session_id = first["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        assert_eq!(first["phase"], "phase9");
+        assert_eq!(first["session_created"], true);
+        assert_eq!(first["llm"]["used"], false);
+        assert!(
+            first_events
+                .iter()
+                .any(|event| event["method"] == "session.created")
+        );
+
+        let (second, second_events) = call_rpc(
+            &mut state,
+            2,
+            "agent.ask",
+            json!({
+                "session_id": session_id,
+                "input": "Continue the same conversation."
+            }),
+        );
+        assert_eq!(second["session"]["id"], first["session"]["id"]);
+        assert_eq!(second["session_created"], false);
+        assert!(
+            !second_events
+                .iter()
+                .any(|event| event["method"] == "session.created")
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn agent_ask_requests_permission_when_live_capture_is_needed() {
+        let db_path = temp_db_path("phase9-agent-capture-proposal");
+        let mut state = test_core_state(&db_path);
+
+        let (result, events) = call_rpc(
+            &mut state,
+            1,
+            "agent.ask",
+            json!({ "input": "请抓包看看当前网络是否有异常流量" }),
+        );
+
+        assert_eq!(result["phase"], "phase9");
+        assert_eq!(result["capture_proposal"]["status"], "waiting_permission");
+        assert_eq!(result["capture_proposal"]["capture"]["duration"], 10);
+        assert!(
+            events
+                .iter()
+                .any(|event| event["method"] == "permission.asked")
+        );
+        assert_eq!(state.permission_manager.list_pending().len(), 1);
+        assert!(state.capture_job.is_none());
+
+        let _ = std::fs::remove_file(db_path);
     }
 }

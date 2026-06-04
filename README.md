@@ -17,6 +17,16 @@ Run the core process from the repository root:
 cargo run -p netagent-core
 ```
 
+To enable real LLM chat for `agent.ask`, export an OpenAI-compatible configuration before starting the core:
+
+```bash
+export NETAGENT_LLM_API_KEY="..."
+export NETAGENT_LLM_API_BASE="https://api.openai.com/v1"
+export NETAGENT_LLM_MODEL="gpt-4.1-mini"
+```
+
+The core will fall back to a local mock response when these variables are absent.
+
 The core uses stdio JSON-RPC. You can verify that it starts correctly with:
 
 ```bash
