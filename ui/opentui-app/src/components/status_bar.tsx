@@ -1,9 +1,10 @@
-import type { DashboardSnapshot, UiMode } from "../app/state"
+import type { DashboardSnapshot, SessionState, SyncState, ViewMode } from "../app/state"
 
 export function StatusBar(props: {
   title: string
-  mode: UiMode
-  loading: boolean
+  mode: ViewMode
+  sync: SyncState
+  session: SessionState
   snapshot: DashboardSnapshot
   pendingCount: number
 }) {
@@ -18,8 +19,8 @@ export function StatusBar(props: {
     >
       <text fg="#e2e8f0">{props.title}</text>
       <text fg="#94a3b8">
-        mode={props.mode} loading={String(props.loading)} pending={props.pendingCount} iface=
-        {props.snapshot.interfaces.join(",") || "n/a"}
+        mode={props.mode} sync={props.sync.status} session={props.session.status} pending=
+        {props.pendingCount} iface={props.snapshot.interfaces.join(",") || "n/a"}
       </text>
     </box>
   )

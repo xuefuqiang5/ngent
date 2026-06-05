@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import type { KeyEvent } from "@opentui/core"
-import { initialState } from "./state"
+import {
+  canSubmitPrompt,
+  deriveViewMode,
+  initialState,
+  type AppState,
+} from "./state"
 import { applyChatInputKey, reduceEvent } from "./App"
 
 describe("App event reducer", () => {
@@ -66,7 +71,68 @@ describe("App event reducer", () => {
 
     expect(value).toBe("hi ")
   })
+
+  test("derives approval mode from pending permission only", () => {
+    const state = reduceEvent(
+      {
+        ...readyState(),
+        session: {
+          ...readyState().session,
+          status: "busy",
+        },
+      },
+      {
+        method: "permission.asked",
+        params: {
+          request: {
+            id: "permission_0001",
+            session_id: "session_0001",
+            permission: "capture.start",
+            risk: "medium",
+            patterns: ["en0"],
+            metadata: {
+              tool: "capture.start",
+              command_preview: "tcpdump -i en0",
+              reason: "Investigate live traffic.",
+            },
+          },
+        },
+      },
+    )
+
+    expect(deriveViewMode(state)).toBe("approval")
+    expect(canSubmitPrompt(state)).toBe(false)
+  })
+
+  test("allows prompt submission only when sync is ready and session is idle", () => {
+    const ready = readyState()
+    const syncing = {
+      ...ready,
+      sync: { status: "syncing" as const },
+    }
+    const error = {
+      ...ready,
+      sync: { status: "error" as const, error: "core unavailable" },
+    }
+    const busy = {
+      ...ready,
+      session: { ...ready.session, status: "busy" as const },
+    }
+
+    expect(canSubmitPrompt(ready)).toBe(true)
+    expect(canSubmitPrompt(syncing)).toBe(false)
+    expect(canSubmitPrompt(error)).toBe(false)
+    expect(canSubmitPrompt(busy)).toBe(false)
+    expect(deriveViewMode(error)).toBe("syncing")
+  })
 })
+
+function readyState(): AppState {
+  return {
+    ...initialState(),
+    sync: { status: "ready" },
+  }
+}
 
 function key(
   name: string,
