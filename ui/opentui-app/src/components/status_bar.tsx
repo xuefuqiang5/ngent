@@ -1,26 +1,36 @@
-import type { DashboardSnapshot, SessionState, SyncState, ViewMode } from "../app/state"
+import type {
+  CaptureState,
+  DashboardSnapshot,
+  SessionState,
+  SyncState,
+  ViewMode,
+} from "../app/state"
 
 export function StatusBar(props: {
-  title: string
   mode: ViewMode
   sync: SyncState
   session: SessionState
   snapshot: DashboardSnapshot
+  capture: CaptureState
   pendingCount: number
 }) {
+  const iface =
+    props.capture.captureInterface !== "n/a"
+      ? props.capture.captureInterface
+      : props.snapshot.interfaces[0] ?? "n/a"
+  const coreStatus = props.sync.status === "error" ? "error" : props.sync.status
+
   return (
     <box
       flexDirection="row"
       justifyContent="space-between"
-      borderStyle="single"
-      borderColor="#334155"
       paddingX={1}
       paddingY={0}
     >
-      <text fg="#e2e8f0">{props.title}</text>
+      <text fg="#e5e7eb">NetAgent</text>
       <text fg="#94a3b8">
-        mode={props.mode} sync={props.sync.status} session={props.session.status} pending=
-        {props.pendingCount} iface={props.snapshot.interfaces.join(",") || "n/a"}
+        {coreStatus} · mode:{props.mode} · session:{props.session.status} · capture:
+        {props.capture.status} · iface:{iface} · pending:{props.pendingCount}
       </text>
     </box>
   )

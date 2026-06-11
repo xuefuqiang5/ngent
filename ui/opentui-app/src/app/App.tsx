@@ -14,10 +14,8 @@ import type {
 import {
   canSubmitPrompt,
   deriveViewMode,
-  describeWorkspace,
   initialState,
 } from "./state"
-import { ApprovalModal } from "../components/approval_modal"
 import { StatusBar } from "../components/status_bar"
 
 type AppProps = {
@@ -106,12 +104,15 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
     }))
   })
 
-  const recentEvents = useMemo(() => state.events.slice(-8).reverse(), [state.events])
   const recentMessages = useMemo(
     () => state.session.messages.slice(-8),
     [state.session.messages],
   )
-  const findings = useMemo(() => state.alerts.slice(-4).reverse(), [state.alerts])
+  const workTrace = useMemo(
+    () => state.events.map(summarizeCoreEvent).filter(isTraceItem).slice(-6),
+    [state.events],
+  )
+  const findings = useMemo(() => state.alerts.slice(-3).reverse(), [state.alerts])
 
   async function hydrate(): Promise<void> {
     setState((current: AppState) => ({
@@ -306,123 +307,56 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
       gap={1}
     >
       <StatusBar
-        title={describeWorkspace()}
         mode={viewMode}
         sync={state.sync}
         session={state.session}
         snapshot={state.dashboard}
+        capture={state.capture}
         pendingCount={state.permission.pending.length}
       />
 
-      <box flexDirection="row" gap={1} flexGrow={1}>
-        <box
-          width="34%"
-          flexDirection="column"
-          borderStyle="single"
-          borderColor="#334155"
-          padding={1}
-          gap={1}
-        >
-          <text fg="#cbd5e1">Dashboard</text>
-          <PanelLine label="Protocol" value={state.dashboard.protocolVersion} />
-          <PanelLine label="Methods" value={String(state.dashboard.methodCount)} />
-          <PanelLine label="Events" value={String(state.dashboard.eventCount)} />
-          <PanelLine label="Interfaces" value={state.dashboard.interfaces.join(", ")} />
-          <PanelLine label="RunState" value={state.dashboard.runState} />
-          <PanelLine label="Capture" value={state.capture.status} />
-          <PanelLine label="CaptureId" value={state.capture.captureId} />
-          <PanelLine label="Interface" value={state.capture.captureInterface} />
-          <PanelLine label="Session" value={state.session.sessionId} />
-          <PanelLine label="Pending" value={String(state.permission.pending.length)} />
-          <PanelLine label="Findings" value={String(state.alerts.length)} />
-          {state.sync.status === "error" ? (
-            <PanelLine label="SyncError" value={state.sync.error ?? "unknown"} />
-          ) : null}
+      <box
+        flexDirection="column"
+        flexGrow={1}
+        borderStyle="single"
+        borderColor="#1f2937"
+        padding={1}
+        gap={1}
+      >
+        <box flexDirection="column" flexGrow={1} gap={1}>
+          {recentMessages.map((message) => (
+            <ThreadMessage key={message.id} message={message} />
+          ))}
 
-          <box marginTop={1} flexDirection="column" gap={1}>
-            <text fg="#cbd5e1">Alerts</text>
-            {findings.length === 0 ? (
-              <text fg="#64748b">No findings yet.</text>
-            ) : (
-              findings.map((finding: AlertItem) => (
-                <box key={finding.id} flexDirection="column">
-                  <text fg={severityColor(finding.severity)}>
-                    {finding.severity.toUpperCase()} {finding.title}
-                  </text>
-                  <text fg="#94a3b8">{finding.summary}</text>
-                </box>
-              ))
-            )}
-          </box>
-        </box>
-
-        <box
-          width="66%"
-          flexDirection="column"
-          borderStyle="single"
-          borderColor="#334155"
-          padding={1}
-          gap={1}
-        >
-          <text fg="#cbd5e1">Activity</text>
-          <box flexDirection="column" flexGrow={1} gap={1}>
-            {recentEvents.map((event: CoreEvent, index: number) => (
-              <box key={`${event.method}-${index}`} flexDirection="column">
-                <text fg="#f8fafc">{event.method}</text>
-                <text fg="#64748b">{truncate(JSON.stringify(event.params), 96)}</text>
-              </box>
-            ))}
-          </box>
-
-          <box
-            flexDirection="column"
-            borderStyle="single"
-            borderColor="#1e293b"
-            padding={1}
-            gap={1}
-          >
-            <text fg="#cbd5e1">Agent Chat</text>
-            <box flexDirection="column" gap={1}>
-              {recentMessages.map((message) => (
-                <box key={message.id} flexDirection="column">
-                  <text fg={chatRoleColor(message.role, message.status)}>
-                    {chatRoleLabel(message.role, message.status)}
-                  </text>
-                  <text fg="#e2e8f0">{truncate(message.content, 320)}</text>
-                </box>
+          {workTrace.length > 0 ? (
+            <box flexDirection="column" marginTop={1} gap={0}>
+              {workTrace.map((item, index) => (
+                <TraceLine key={`${item.title}-${index}`} item={item} />
               ))}
             </box>
-            <box
-              borderStyle="single"
-              borderColor={canSubmitPrompt(state) ? "#0f766e" : "#facc15"}
-              padding={1}
-            >
-              <text fg={state.session.chatInput ? "#e2e8f0" : "#64748b"}>
-                {state.session.chatInput || "Ask NetAgent..."}
-              </text>
+          ) : null}
+
+          <InlinePermissionCard request={state.permission.pending[0]} />
+
+          <FindingsStrip findings={findings} totalCount={state.alerts.length} />
+
+          {state.sync.status === "error" ? (
+            <box flexDirection="column" marginTop={1}>
+              <text fg="#f97316">Core unavailable</text>
+              <text fg="#94a3b8">{truncate(state.sync.error ?? "unknown error", 120)}</text>
             </box>
-            <text fg="#64748b">
-              Enter send | Backspace edit | Ctrl+R refresh | Esc quit
-            </text>
-          </box>
+          ) : null}
+        </box>
+
+        <box flexDirection="column" marginTop={1} gap={1}>
+          <Composer state={state} />
+          <text fg="#4b5563">
+            Enter send · Backspace edit · Ctrl+R refresh · Esc quit
+          </text>
         </box>
       </box>
-
-      <ApprovalModal
-        request={state.permission.pending[0]}
-        visible={state.permission.pending.length > 0}
-      />
     </box>
   )
-
-  function PanelLine(props: { label: string; value: string }) {
-    return (
-      <box flexDirection="row" justifyContent="space-between">
-        <text fg="#64748b">{props.label}</text>
-        <text fg="#e2e8f0">{props.value}</text>
-      </box>
-    )
-  }
 }
 
 export function applyChatInputKey(value: string, event: KeyEvent): string {
@@ -458,24 +392,271 @@ function markSystemMessage(messages: AppState["session"]["messages"], content: s
   return [{ ...first, status: "sent" as const, content }, ...rest]
 }
 
-function chatRoleLabel(
-  role: "user" | "assistant" | "system",
-  status: "sending" | "sent" | "error",
-): string {
-  if (status === "error") return `${role} error`
-  if (role === "user") return "you"
-  if (role === "assistant") return "netagent"
-  return "system"
+function ThreadMessage(props: {
+  message: AppState["session"]["messages"][number]
+}) {
+  if (props.message.role === "user") {
+    return (
+      <box flexDirection="column" marginBottom={1}>
+        <text fg="#e5e7eb">{`> ${truncate(props.message.content, 220)}`}</text>
+      </box>
+    )
+  }
+
+  if (props.message.status === "error") {
+    return (
+      <box flexDirection="column" marginBottom={1}>
+        <text fg="#f97316">error</text>
+        <text fg="#d1d5db">{truncate(props.message.content, 260)}</text>
+      </box>
+    )
+  }
+
+  if (props.message.role === "system") {
+    return (
+      <box flexDirection="column" marginBottom={1}>
+        <text fg="#6b7280">{truncate(props.message.content, 220)}</text>
+      </box>
+    )
+  }
+
+  return (
+    <box flexDirection="column" marginBottom={1}>
+      <text fg="#e2e8f0">{truncate(props.message.content, 420)}</text>
+    </box>
+  )
 }
 
-function chatRoleColor(
-  role: "user" | "assistant" | "system",
-  status: "sending" | "sent" | "error",
-): string {
+type TraceItem = {
+  title: string
+  detail?: string
+  status?: "running" | "done" | "error" | "pending"
+}
+
+function isTraceItem(item: TraceItem | null): item is TraceItem {
+  return item !== null
+}
+
+function TraceLine(props: { item: TraceItem }) {
+  return (
+    <box flexDirection="column" marginBottom={1}>
+      <text fg="#94a3b8">{props.item.title}</text>
+      {props.item.detail ? (
+        <text fg={traceStatusColor(props.item.status)}>
+          {`  ${traceStatusLabel(props.item.status)}${props.item.detail}`}
+        </text>
+      ) : null}
+    </box>
+  )
+}
+
+function Composer(props: { state: AppState }) {
+  const canSubmit = canSubmitPrompt(props.state)
+  const input = props.state.session.chatInput
+  const text = input || (canSubmit ? "Ask NetAgent..." : blockedReason(props.state))
+
+  return (
+    <box
+      borderStyle="single"
+      borderColor={canSubmit ? "#334155" : "#b45309"}
+      paddingX={1}
+      paddingY={0}
+    >
+      <text fg={input ? "#e5e7eb" : canSubmit ? "#6b7280" : "#d97706"}>
+        {`> ${text}`}
+      </text>
+    </box>
+  )
+}
+
+function InlinePermissionCard(props: { request?: PendingApproval }) {
+  if (!props.request) return null
+
+  return (
+    <box
+      flexDirection="column"
+      marginTop={1}
+      marginBottom={1}
+      borderStyle="single"
+      borderColor="#b45309"
+      padding={1}
+      gap={1}
+    >
+      <text fg="#f59e0b">
+        {`permission required · ${props.request.risk} risk`}
+      </text>
+      <text fg="#e5e7eb">{props.request.metadata.tool}</text>
+      <text fg="#cbd5e1">{truncate(props.request.metadata.reason, 180)}</text>
+      {props.request.patterns.length > 0 ? (
+        <text fg="#94a3b8">
+          {`scope: ${truncate(props.request.patterns.join(" "), 160)}`}
+        </text>
+      ) : null}
+      <text fg="#94a3b8">
+        {`preview: ${truncate(props.request.metadata.command_preview, 180)}`}
+      </text>
+      <text fg="#d97706">[Y] once   [A] always   [N] reject   [F] feedback</text>
+    </box>
+  )
+}
+
+function FindingsStrip(props: { findings: AlertItem[]; totalCount: number }) {
+  if (props.totalCount === 0) {
+    return <text fg="#4b5563">Findings: none</text>
+  }
+
+  const latest = props.findings[0]
+  const summary = latest
+    ? `${latest.severity} · ${latest.title}`
+    : `${props.totalCount} findings`
+
+  return (
+    <text fg={latest ? severityColor(latest.severity) : "#94a3b8"}>
+      {`Findings: ${props.totalCount} · latest: ${truncate(summary, 120)}`}
+    </text>
+  )
+}
+
+export function summarizeCoreEvent(event: CoreEvent): TraceItem | null {
+  if (event.method === "agent.step.started") {
+    return {
+      title: "Thinking through request",
+      detail: "step running",
+      status: "running",
+    }
+  }
+
+  if (event.method === "agent.step.ended") {
+    return {
+      title: "Finishing response",
+      detail: "step completed",
+      status: "done",
+    }
+  }
+
+  if (event.method === "agent.tool.called") {
+    return {
+      title: "Running tool",
+      detail: readToolName(event.params),
+      status: "running",
+    }
+  }
+
+  if (event.method === "agent.tool.progress") {
+    return {
+      title: "Tool progress",
+      detail: getString(event.params, "message") ?? "running",
+      status: "running",
+    }
+  }
+
+  if (event.method === "agent.tool.success") {
+    return {
+      title: "Tool completed",
+      detail: readToolName(event.params),
+      status: "done",
+    }
+  }
+
+  if (event.method === "capture.started") {
+    return {
+      title: "Starting live capture",
+      detail: formatCaptureScope(event.params),
+      status: "running",
+    }
+  }
+
+  if (event.method === "capture.stopped") {
+    return {
+      title: "Capture stopped",
+      detail: getString(event.params, "reason") ?? "stopped",
+      status: "done",
+    }
+  }
+
+  if (event.method === "finding.created") {
+    const finding = normalizeFinding(event.params)
+    return {
+      title: "Finding recorded",
+      detail: `${finding.severity} · ${finding.title}`,
+      status: "done",
+    }
+  }
+
+  if (event.method === "artifact.created" || event.method === "pcap.created") {
+    return {
+      title: "Evidence artifact recorded",
+      detail: readArtifactLabel(event.params),
+      status: "done",
+    }
+  }
+
+  return null
+}
+
+function blockedReason(state: AppState): string {
+  if (state.permission.pending.length > 0) return "Permission required; choose Y/A/N/F"
+  if (state.sync.status === "error") return "Core unavailable; Ctrl+R to retry"
+  if (state.sync.status === "syncing") return "Core is syncing"
+  if (state.session.status === "busy") return "Agent is responding"
+  return "Ask NetAgent..."
+}
+
+function traceStatusLabel(status: TraceItem["status"]): string {
+  if (status === "running") return "running: "
+  if (status === "done") return "done: "
+  if (status === "error") return "failed: "
+  if (status === "pending") return "pending: "
+  return ""
+}
+
+function traceStatusColor(status: TraceItem["status"]): string {
+  if (status === "running") return "#94a3b8"
+  if (status === "done") return "#6ee7b7"
   if (status === "error") return "#f97316"
-  if (role === "user") return "#38bdf8"
-  if (role === "assistant") return "#34d399"
+  if (status === "pending") return "#f59e0b"
   return "#94a3b8"
+}
+
+function readToolName(params: unknown): string {
+  return (
+    getString(params, "tool_name") ??
+    getString((params as { tool_call?: unknown }).tool_call, "tool_name") ??
+    "tool"
+  )
+}
+
+function formatCaptureScope(params: unknown): string {
+  const iface = getString(params, "interface") ?? "interface n/a"
+  const duration = getNumber(params, "duration_secs")
+  const filter = getString(params, "filter")
+  return [
+    `iface=${iface}`,
+    filter ? `filter=${filter}` : undefined,
+    duration ? `duration=${duration}s` : undefined,
+  ]
+    .filter(Boolean)
+    .join(" ")
+}
+
+function readArtifactLabel(params: unknown): string {
+  const artifact = (params as { artifact?: unknown }).artifact
+  return (
+    getString(artifact, "id") ??
+    getString(artifact, "path") ??
+    getString(params, "capture_id") ??
+    "artifact"
+  )
+}
+
+function getString(params: unknown, key: string): string | undefined {
+  const value = (params as Record<string, unknown> | undefined)?.[key]
+  return typeof value === "string" ? value : undefined
+}
+
+function getNumber(params: unknown, key: string): number | undefined {
+  const value = (params as Record<string, unknown> | undefined)?.[key]
+  return typeof value === "number" ? value : undefined
 }
 
 function nextUiId(prefix: string): string {

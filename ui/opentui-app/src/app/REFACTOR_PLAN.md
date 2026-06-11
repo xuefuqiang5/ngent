@@ -1,13 +1,25 @@
 # State Architecture Refactor Plan
 
-> **Current phase:** Phase 2 — Agent Runtime integration (per `netagent_build_spec.md`)
+> **Current project phase:** Phase 9 partial — User-Assistant Interaction Maturity (per `netagent_build_spec.md`)
+> **Implementation status:** P0 and P1 are implemented. P2 capture tool modeling is deferred to Phase 12.
 > **Anti-drift compliance:** This refactor addresses the rule *"Do not let UI or harness execute system commands directly."*
+
+---
+
+## Status Summary
+
+- P0 correctness fixes are complete.
+- P1 state architecture refactor is complete.
+- `viewMode` is derived via `deriveViewMode(state)` and must not be manually written.
+- Prompt submission is gated by `canSubmitPrompt(state)`.
+- `Ctrl+X` no longer calls `capture.stop`; do not reintroduce direct UI capture-control shortcuts.
+- P2 capture tool modeling requires backend LLM tool-calling infrastructure and must wait until Phase 12.
 
 ---
 
 ## Problem Statement
 
-The current `state.ts` uses a single `mode: UiMode` field (`"dashboard" | "agent" | "approval" | "syncing"`) to represent four unrelated concerns:
+Before this refactor, `state.ts` used a single `mode: UiMode` field (`"dashboard" | "agent" | "approval" | "syncing"`) to represent four unrelated concerns:
 
 | Concern                                 | Where it leaks into `mode`               |
 | --------------------------------------- | ---------------------------------------- |
@@ -16,7 +28,7 @@ The current `state.ts` uses a single `mode: UiMode` field (`"dashboard" | "agent
 | Permission interrupt / block            | `approval` is an overlay, not a view mode |
 | Idle monitoring                         | `dashboard` is the default resting state |
 
-This causes three concrete problems verified against the current code:
+This caused three concrete problems verified against the old code:
 
 1. **Deterministic bug** — Enter key bypasses approval (L90 in `App.tsx` has no mode gate; `sendAgentPrompt` L150 only checks `state.loading`).
 2. **Anti-drift violation** — `Ctrl+X` calls `capture.stop` RPC directly (L60-63), bypassing the Agent → Permission → Tool execution chain.
@@ -82,7 +94,7 @@ viewMode is derived, never written:
 
 ## Implementation Steps
 
-### Phase 0 — P0: Fix correctness bugs (MUST DO FIRST)
+### Phase 0 — P0: Fix correctness bugs (DONE)
 
 #### Step 0.1 — Guard Enter key against approval and sync states
 
@@ -144,7 +156,7 @@ Capture control should only flow through: User prompt → Agent decision → too
 
 ---
 
-### Phase 1 — P1: Architectural improvements
+### Phase 1 — P1: Architectural improvements (DONE)
 
 #### Step 1.1 — Split UiState into slices
 
@@ -319,9 +331,9 @@ useKeyboard((event) => {
 
 ---
 
-### Phase 2 — P2: Capture tool modeling
+### Phase 2 — P2: Capture tool modeling (DEFERRED TO PHASE 12)
 
-> **Note:** This requires corresponding backend tool registration. Do not implement before P0 and P1 are complete.
+> **Note:** This requires corresponding backend tool registration and LLM tool-calling infrastructure. Do not implement before Phase 10 session persistence and Phase 11 read-only tool-calling are complete.
 
 Register capture operations as agent tools:
 

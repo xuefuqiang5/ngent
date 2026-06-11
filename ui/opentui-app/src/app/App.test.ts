@@ -6,7 +6,7 @@ import {
   initialState,
   type AppState,
 } from "./state"
-import { applyChatInputKey, reduceEvent } from "./App"
+import { applyChatInputKey, reduceEvent, summarizeCoreEvent } from "./App"
 
 describe("App event reducer", () => {
   test("upserts duplicate finding events by id", () => {
@@ -124,6 +124,38 @@ describe("App event reducer", () => {
     expect(canSubmitPrompt(error)).toBe(false)
     expect(canSubmitPrompt(busy)).toBe(false)
     expect(deriveViewMode(error)).toBe("syncing")
+  })
+
+  test("summarizes tool events as bounded work trace items", () => {
+    expect(
+      summarizeCoreEvent({
+        method: "agent.tool.called",
+        params: {
+          tool_call: {
+            tool_name: "flow.list",
+            input: { limit: 20 },
+          },
+        },
+      }),
+    ).toEqual({
+      title: "Running tool",
+      detail: "flow.list",
+      status: "running",
+    })
+  })
+
+  test("does not promote raw message events into work trace", () => {
+    expect(
+      summarizeCoreEvent({
+        method: "message.created",
+        params: {
+          message: {
+            id: "msg_0001",
+            parts: [{ content: "raw message payload" }],
+          },
+        },
+      }),
+    ).toBe(null)
   })
 })
 
