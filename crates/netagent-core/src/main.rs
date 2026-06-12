@@ -14,7 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::analyzers::dns::detect_nxdomain_spike;
-use crate::core::agent::{AgentAskInput, AgentRuntime, AgentTurn};
+use crate::core::agent::{AgentAskInput, AgentRuntime, AgentTurn, SessionRecord};
 use crate::core::permissions::{PermissionManager, PermissionOutcome};
 use crate::reports::markdown::{
     EvidenceBundleMetadata, MarkdownReportInput, build_evidence_bundle_metadata,
@@ -153,15 +153,33 @@ fn run() -> io::Result<()> {
         finding_counter: 0,
     };
 
+    // Restore persisted sessions from SQLite so conversation history survives restarts
+    match restore_agent_sessions(&mut state) {
+        Ok(count) => {
+            if count > 0 {
+                let _ = writeln!(
+                    io::stderr(),
+                    "netagent-core: restored {count} session(s) from database"
+                );
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "netagent-core: failed to restore sessions: {error}"
+            );
+        }
+    }
+
     write_message(
         &mut stdout,
         &RpcNotification {
             jsonrpc: JSON_RPC_VERSION,
             method: "event.core.ready",
             params: json!({
-                "phase": "phase9",
+                "phase": "phase10",
                 "protocol_version": JSON_RPC_VERSION,
-                "message": "NetAgent core ready — Phase 9 agent chat and LLM integration."
+                "message": "NetAgent core ready - Phase 10 session persistence."
             }),
         },
     )?;
@@ -214,18 +232,21 @@ fn handle_request<W: Write>(
     let result = match request.method.as_str() {
         "system.ping" => Ok(json!({
             "ok": true,
-            "phase": "phase9",
+            "phase": "phase10",
             "message": "pong"
         })),
         "core.capabilities" => Ok(json!({
             "protocol_version": JSON_RPC_VERSION,
-            "phase": "phase9",
+            "phase": "phase10",
             "methods": [
                 "system.ping",
                 "core.capabilities",
                 "system.list_interfaces",
                 "agent.ask",
                 "agent.abort",
+                "session.list",
+                "session.get",
+                "message.list",
                 "capture.start",
                 "capture.status",
                 "capture.stop",
@@ -309,7 +330,16 @@ fn handle_request<W: Write>(
                     .as_ref()
                     .map(agent_capture_recommendation_text),
             }) {
-                Ok(turn) => turn,
+                Ok(turn) => {
+                    // Persist the turn to SQLite
+                    if let Err(error) = persist_agent_turn(&state.sqlite_store, &turn) {
+                        let _ = writeln!(
+                            io::stderr(),
+                            "netagent-core: failed to persist agent turn: {error}"
+                        );
+                    }
+                    turn
+                }
                 Err(message) => {
                     return Ok(error_response(
                         request.id,
@@ -344,8 +374,11 @@ fn handle_request<W: Write>(
         "agent.abort" => Ok(json!({
             "aborted": false,
             "run_state": RunState::Idle,
-            "message": "No long-running agent step is active in Phase 9."
+            "message": "No long-running agent step is active in Phase 10."
         })),
+        "session.list" => handle_session_list(state),
+        "session.get" => handle_session_get(state, &request.params),
+        "message.list" => handle_message_list(state, &request.params),
         "capture.start" => handle_capture_start(state, writer, &request.params),
         "capture.status" => handle_capture_status(state),
         "capture.stop" => handle_capture_stop(state, writer),
@@ -392,6 +425,16 @@ fn error_response(id: Value, error: RpcError) -> RpcResponse {
         result: None,
         error: Some(error),
     }
+}
+
+fn required_string_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, RpcError> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError {
+            code: -32602,
+            message: format!("{key} is required"),
+        })
 }
 
 fn emit_agent_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::Result<()> {
@@ -458,7 +501,7 @@ fn emit_agent_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::Res
         json!({
             "step": turn.step,
             "run_state": turn.final_run_state,
-            "phase": "phase9",
+            "phase": "phase10",
             "llm": {
                 "used": turn.llm_used,
                 "model": turn.llm_model,
@@ -629,6 +672,103 @@ fn agent_capture_recommendation_text(plan: &AgentCapturePlan) -> String {
         "I recommend requesting user approval for a bounded live capture: interface={}, filter={}, duration={}s. Reason: {}",
         plan.interface, plan.filter, plan.duration_secs, plan.reason
     )
+}
+
+/// Load all persisted sessions (with their messages) from SQLite and restore them
+/// into the agent runtime so conversation context survives restarts.
+fn restore_agent_sessions(state: &mut CoreState) -> Result<usize, String> {
+    let sessions = state.sqlite_store.list_sessions()?;
+    if sessions.is_empty() {
+        return Ok(0);
+    }
+
+    let mut records = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let messages = state.sqlite_store.load_messages(&session.id)?;
+        let steps = state.sqlite_store.load_steps(&session.id)?;
+        records.push(SessionRecord {
+            session,
+            messages,
+            steps,
+        });
+    }
+
+    let count = records.len();
+    state.agent_runtime.restore_sessions(records);
+    Ok(count)
+}
+
+/// Persist the result of a single agent turn to SQLite.
+fn persist_agent_turn(store: &SqliteStore, turn: &AgentTurn) -> Result<(), String> {
+    store.save_agent_turn(
+        &turn.session_finished,
+        &turn.user_message,
+        &turn.assistant_message,
+        &turn.step,
+    )
+}
+
+fn handle_session_list(state: &CoreState) -> Result<Value, RpcError> {
+    let sessions = state
+        .sqlite_store
+        .list_sessions()
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
+    Ok(json!({
+        "sessions": sessions
+    }))
+}
+
+fn handle_session_get(state: &CoreState, params: &Value) -> Result<Value, RpcError> {
+    let session_id = required_string_param(params, "session_id")?;
+    let session = state
+        .sqlite_store
+        .load_session(session_id)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?
+        .ok_or_else(|| RpcError {
+            code: -32012,
+            message: format!("session not found: {session_id}"),
+        })?;
+    let messages = state
+        .sqlite_store
+        .load_messages(session_id)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
+    let steps = state
+        .sqlite_store
+        .load_steps(session_id)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
+
+    Ok(json!({
+        "session": session,
+        "messages": messages,
+        "steps": steps
+    }))
+}
+
+fn handle_message_list(state: &CoreState, params: &Value) -> Result<Value, RpcError> {
+    let session_id = required_string_param(params, "session_id")?;
+    let messages = state
+        .sqlite_store
+        .load_messages(session_id)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
+    Ok(json!({
+        "session_id": session_id,
+        "messages": messages
+    }))
 }
 
 fn handle_capture_start<W: Write>(
@@ -2069,7 +2209,7 @@ mod tests {
             .as_str()
             .expect("session id")
             .to_string();
-        assert_eq!(first["phase"], "phase9");
+        assert_eq!(first["phase"], "phase10");
         assert_eq!(first["session_created"], true);
         assert_eq!(first["llm"]["used"], false);
         assert!(
@@ -2099,6 +2239,92 @@ mod tests {
     }
 
     #[test]
+    fn session_rpc_methods_read_persisted_agent_history() {
+        let db_path = temp_db_path("phase10-session-rpc");
+        let mut state = test_core_state(&db_path);
+
+        let (turn, _) = call_rpc(
+            &mut state,
+            1,
+            "agent.ask",
+            json!({ "input": "Summarize current state." }),
+        );
+        let session_id = turn["session"]["id"].as_str().expect("session id");
+
+        let (sessions, _) = call_rpc(&mut state, 2, "session.list", json!({}));
+        assert_eq!(sessions["sessions"].as_array().expect("sessions").len(), 1);
+        assert_eq!(sessions["sessions"][0]["id"], session_id);
+
+        let (messages, _) = call_rpc(
+            &mut state,
+            3,
+            "message.list",
+            json!({ "session_id": session_id }),
+        );
+        let message_list = messages["messages"].as_array().expect("messages");
+        assert_eq!(message_list.len(), 2);
+        assert_eq!(message_list[0]["role"], "user");
+        assert_eq!(message_list[1]["role"], "assistant");
+
+        let (session, _) = call_rpc(
+            &mut state,
+            4,
+            "session.get",
+            json!({ "session_id": session_id }),
+        );
+        assert_eq!(session["session"]["id"], session_id);
+        assert_eq!(session["messages"].as_array().expect("messages").len(), 2);
+        assert_eq!(session["steps"].as_array().expect("steps").len(), 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn restored_agent_runtime_continues_ids_without_collisions() {
+        let db_path = temp_db_path("phase10-restore-counters");
+        let mut state = test_core_state(&db_path);
+
+        let (first, _) = call_rpc(
+            &mut state,
+            1,
+            "agent.ask",
+            json!({ "input": "Start investigation." }),
+        );
+        let session_id = first["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        drop(state);
+
+        let mut restored = test_core_state(&db_path);
+        assert_eq!(restore_agent_sessions(&mut restored).expect("restore"), 1);
+
+        let (second, _) = call_rpc(
+            &mut restored,
+            2,
+            "agent.ask",
+            json!({
+                "session_id": session_id,
+                "input": "Continue after restart."
+            }),
+        );
+        assert_eq!(second["session_created"], false);
+        assert_eq!(second["assistant_message"]["id"], "msg_0004");
+        assert_eq!(second["assistant_message"]["parts"][0]["id"], "part_0004");
+        assert_eq!(second["step"]["id"], "step_0002");
+
+        let (messages, _) = call_rpc(
+            &mut restored,
+            3,
+            "message.list",
+            json!({ "session_id": session_id }),
+        );
+        assert_eq!(messages["messages"].as_array().expect("messages").len(), 4);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
     fn agent_ask_requests_permission_when_live_capture_is_needed() {
         let db_path = temp_db_path("phase9-agent-capture-proposal");
         let mut state = test_core_state(&db_path);
@@ -2110,7 +2336,7 @@ mod tests {
             json!({ "input": "请抓包看看当前网络是否有异常流量" }),
         );
 
-        assert_eq!(result["phase"], "phase9");
+        assert_eq!(result["phase"], "phase10");
         assert_eq!(result["capture_proposal"]["status"], "waiting_permission");
         assert_eq!(result["capture_proposal"]["capture"]["duration"], 10);
         assert!(

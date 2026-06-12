@@ -1,7 +1,10 @@
 use std::fmt;
 use std::path::Path;
 
-use netagent_models::{DnsEvent, Finding, Flow};
+use netagent_models::{
+    AgentMode, DnsEvent, Finding, Flow, Message, MessageRole, RunState, Session, Step, StepStatus,
+    ToolCall, ToolCallStatus,
+};
 use rusqlite::{Connection, params};
 
 pub struct SqliteStore {
@@ -68,6 +71,41 @@ impl SqliteStore {
                     evidence TEXT NOT NULL DEFAULT '[]',
                     recommended_actions TEXT NOT NULL DEFAULT '[]',
                     metadata TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    run_state TEXT NOT NULL,
+                    max_steps INTEGER NOT NULL DEFAULT 8,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS messages (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    parts TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS steps (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS tool_calls (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    input TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
                 ",
             )
@@ -337,5 +375,287 @@ impl SqliteStore {
                 row.get::<_, usize>(0)
             })
             .map_err(|e| format!("failed to count findings: {e}"))
+    }
+
+    // ── Sessions ──
+
+    pub fn save_session(&self, session: &Session) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO sessions (id, mode, run_state, max_steps)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET
+                    mode = excluded.mode,
+                    run_state = excluded.run_state,
+                    max_steps = excluded.max_steps,
+                    updated_at = datetime('now')",
+                rusqlite::params![
+                    session.id,
+                    serde_json::to_string(&session.mode).unwrap_or_default(),
+                    serde_json::to_string(&session.run_state).unwrap_or_default(),
+                    session.max_steps,
+                ],
+            )
+            .map_err(|e| format!("failed to save session: {e}"))?;
+        Ok(())
+    }
+
+    pub fn save_agent_turn(
+        &self,
+        session: &Session,
+        user_message: &Message,
+        assistant_message: &Message,
+        step: &Step,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to begin agent turn transaction: {e}"))?;
+
+        tx.execute(
+            "INSERT INTO sessions (id, mode, run_state, max_steps)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                mode = excluded.mode,
+                run_state = excluded.run_state,
+                max_steps = excluded.max_steps,
+                updated_at = datetime('now')",
+            rusqlite::params![
+                session.id,
+                serde_json::to_string(&session.mode).unwrap_or_default(),
+                serde_json::to_string(&session.run_state).unwrap_or_default(),
+                session.max_steps,
+            ],
+        )
+        .map_err(|e| format!("failed to save session in agent turn: {e}"))?;
+
+        for message in [user_message, assistant_message] {
+            let parts_json = serde_json::to_string(&message.parts).unwrap_or_default();
+            tx.execute(
+                "INSERT INTO messages (id, session_id, role, parts)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    message.id,
+                    message.session_id,
+                    serde_json::to_string(&message.role).unwrap_or_default(),
+                    parts_json,
+                ],
+            )
+            .map_err(|e| format!("failed to insert message in agent turn: {e}"))?;
+        }
+
+        tx.execute(
+            "INSERT INTO steps (id, session_id, status, attempt)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                step.id,
+                step.session_id,
+                serde_json::to_string(&step.status).unwrap_or_default(),
+                step.attempt,
+            ],
+        )
+        .map_err(|e| format!("failed to insert step in agent turn: {e}"))?;
+
+        tx.commit()
+            .map_err(|e| format!("failed to commit agent turn transaction: {e}"))
+    }
+
+    pub fn load_session(&self, id: &str) -> Result<Option<Session>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, mode, run_state, max_steps FROM sessions WHERE id = ?1")
+            .map_err(|e| format!("failed to prepare session query: {e}"))?;
+
+        let mut rows = stmt
+            .query_map(rusqlite::params![id], |row| {
+                let mode_str: String = row.get(1)?;
+                let run_state_str: String = row.get(2)?;
+                Ok(Session {
+                    id: row.get(0)?,
+                    mode: serde_json::from_str(&mode_str).unwrap_or(AgentMode::Observe),
+                    run_state: serde_json::from_str(&run_state_str).unwrap_or(RunState::Idle),
+                    max_steps: row.get(3)?,
+                })
+            })
+            .map_err(|e| format!("failed to query session: {e}"))?;
+
+        match rows.next() {
+            Some(Ok(session)) => Ok(Some(session)),
+            Some(Err(e)) => Err(format!("failed to read session row: {e}")),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<Session>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, mode, run_state, max_steps
+                 FROM sessions ORDER BY updated_at DESC, created_at DESC, id DESC",
+            )
+            .map_err(|e| format!("failed to prepare session list query: {e}"))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let mode_str: String = row.get(1)?;
+                let run_state_str: String = row.get(2)?;
+                Ok(Session {
+                    id: row.get(0)?,
+                    mode: serde_json::from_str(&mode_str).unwrap_or(AgentMode::Observe),
+                    run_state: serde_json::from_str(&run_state_str).unwrap_or(RunState::Idle),
+                    max_steps: row.get(3)?,
+                })
+            })
+            .map_err(|e| format!("failed to query sessions: {e}"))?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row.map_err(|e| format!("failed to read session row: {e}"))?);
+        }
+        Ok(sessions)
+    }
+
+    // ── Messages ──
+
+    pub fn insert_message(&self, message: &Message) -> Result<(), String> {
+        let parts_json = serde_json::to_string(&message.parts).unwrap_or_default();
+        self.conn
+            .execute(
+                "INSERT INTO messages (id, session_id, role, parts)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    message.id,
+                    message.session_id,
+                    serde_json::to_string(&message.role).unwrap_or_default(),
+                    parts_json,
+                ],
+            )
+            .map_err(|e| format!("failed to insert message: {e}"))?;
+        Ok(())
+    }
+
+    pub fn load_messages(&self, session_id: &str) -> Result<Vec<Message>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, role, parts
+                 FROM messages WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|e| format!("failed to prepare message query: {e}"))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![session_id], |row| {
+                let role_str: String = row.get(2)?;
+                let parts_str: String = row.get(3)?;
+                Ok(Message {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: serde_json::from_str(&role_str).unwrap_or(MessageRole::User),
+                    parts: serde_json::from_str(&parts_str).unwrap_or_default(),
+                })
+            })
+            .map_err(|e| format!("failed to query messages: {e}"))?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row.map_err(|e| format!("failed to read message row: {e}"))?);
+        }
+        Ok(messages)
+    }
+
+    // ── Steps ──
+
+    pub fn insert_step(&self, step: &Step) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO steps (id, session_id, status, attempt)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    step.id,
+                    step.session_id,
+                    serde_json::to_string(&step.status).unwrap_or_default(),
+                    step.attempt,
+                ],
+            )
+            .map_err(|e| format!("failed to insert step: {e}"))?;
+        Ok(())
+    }
+
+    pub fn load_steps(&self, session_id: &str) -> Result<Vec<Step>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, status, attempt
+                 FROM steps WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|e| format!("failed to prepare step query: {e}"))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![session_id], |row| {
+                let status_str: String = row.get(2)?;
+                Ok(Step {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    status: serde_json::from_str(&status_str).unwrap_or(StepStatus::Completed),
+                    attempt: row.get(3)?,
+                })
+            })
+            .map_err(|e| format!("failed to query steps: {e}"))?;
+
+        let mut steps = Vec::new();
+        for row in rows {
+            steps.push(row.map_err(|e| format!("failed to read step row: {e}"))?);
+        }
+        Ok(steps)
+    }
+
+    // ── Tool Calls ──
+
+    pub fn insert_tool_call(&self, tool_call: &ToolCall) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO tool_calls (id, session_id, step_id, tool_name, input, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    tool_call.id,
+                    tool_call.session_id,
+                    tool_call.step_id,
+                    tool_call.tool_name,
+                    tool_call.input,
+                    serde_json::to_string(&tool_call.status).unwrap_or_default(),
+                ],
+            )
+            .map_err(|e| format!("failed to insert tool_call: {e}"))?;
+        Ok(())
+    }
+
+    pub fn load_tool_calls(&self, session_id: &str) -> Result<Vec<ToolCall>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, session_id, step_id, tool_name, input, status
+                 FROM tool_calls WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|e| format!("failed to prepare tool_call query: {e}"))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![session_id], |row| {
+                let status_str: String = row.get(5)?;
+                Ok(ToolCall {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    step_id: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    input: row.get(4)?,
+                    status: serde_json::from_str(&status_str).unwrap_or(ToolCallStatus::Pending),
+                })
+            })
+            .map_err(|e| format!("failed to query tool_calls: {e}"))?;
+
+        let mut calls = Vec::new();
+        for row in rows {
+            calls.push(row.map_err(|e| format!("failed to read tool_call row: {e}"))?);
+        }
+        Ok(calls)
     }
 }

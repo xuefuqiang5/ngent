@@ -45,9 +45,10 @@ pub struct LlmStatus {
 }
 
 #[derive(Debug, Clone)]
-struct SessionRecord {
-    session: Session,
-    messages: Vec<Message>,
+pub struct SessionRecord {
+    pub session: Session,
+    pub messages: Vec<Message>,
+    pub steps: Vec<Step>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +112,53 @@ impl AgentRuntime {
         }
     }
 
+    /// Load persisted session records into the in-memory store and bump counters
+    /// so new IDs don't collide with existing rows.
+    pub fn restore_sessions(&mut self, records: Vec<SessionRecord>) {
+        // Advance counters past the highest ID already in use
+        let ses_max = records
+            .iter()
+            .filter_map(|r| {
+                let num = r.session.id.rsplit('_').next()?;
+                num.parse::<u64>().ok()
+            })
+            .max()
+            .unwrap_or(0);
+        self.session_counter = self.session_counter.max(ses_max);
+
+        let msg_max = records
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .filter_map(|m| {
+                let num = m.id.rsplit('_').next()?;
+                num.parse::<u64>().ok()
+            })
+            .max()
+            .unwrap_or(0);
+        self.message_counter = self.message_counter.max(msg_max);
+
+        let part_max = records
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| Self::id_suffix(&p.id))
+            .max()
+            .unwrap_or(0);
+        self.part_counter = self.part_counter.max(part_max);
+
+        let step_max = records
+            .iter()
+            .flat_map(|r| r.steps.iter())
+            .filter_map(|s| Self::id_suffix(&s.id))
+            .max()
+            .unwrap_or(0);
+        self.step_counter = self.step_counter.max(step_max);
+
+        for record in records {
+            self.sessions.insert(record.session.id.clone(), record);
+        }
+    }
+
     pub fn run_turn(&mut self, input: AgentAskInput) -> Result<AgentTurn, String> {
         let session_created = input
             .session_id
@@ -132,6 +180,7 @@ impl AgentRuntime {
                     max_steps: DEFAULT_MAX_STEPS,
                 },
                 messages: Vec::new(),
+                steps: Vec::new(),
             });
 
         record.session.mode = input.mode;
@@ -152,6 +201,7 @@ impl AgentRuntime {
             status: StepStatus::Completed,
             attempt: 1,
         };
+        record.steps.push(step.clone());
 
         let assistant_text = match &self.llm {
             Some(config) => self.complete_with_llm(
@@ -193,7 +243,7 @@ impl AgentRuntime {
 
     pub fn build_agent_response(turn: &AgentTurn) -> Value {
         json!({
-            "phase": "phase9",
+            "phase": "phase10",
             "session_created": turn.session_created,
             "session": turn.session_finished,
             "step": turn.step,
@@ -223,6 +273,10 @@ impl AgentRuntime {
                 content,
             }],
         }
+    }
+
+    fn id_suffix(id: &str) -> Option<u64> {
+        id.rsplit('_').next()?.parse::<u64>().ok()
     }
 
     fn mock_response(
