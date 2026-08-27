@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://netagent.local/schemas/zeek-process-pcap-result.schema.json",
+  "title": "NetAgent zeek.process_pcap result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "path"],
+  "properties": {
+    "status": {
+      "enum": ["ok", "unavailable"],
+      "description": "ok when zeek ran and logs were parsed; unavailable when the binary is missing, timed out, or failed"
+    },
+    "path": {
+      "type": "string",
+      "description": "Pcap path processed by zeek with fixed arguments"
+    },
+    "binary_available": {
+      "type": "boolean",
+      "description": "Present only when status=unavailable"
+    },
+    "exit_code": {
+      "type": ["integer", "null"],
+      "description": "Present only when status=unavailable"
+    },
+    "timed_out": {
+      "type": "boolean",
+      "description": "Present only when status=unavailable"
+    },
+    "stderr_bounded": {
+      "type": "string",
+      "description": "Bounded stderr; present only when status=unavailable"
+    },
+    "preview": {
+      "type": "string",
+      "description": "Bounded preview for the model context; raw logs never enter it"
+    },
+    "fallback": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Suggested fallback tools; present only when status=unavailable"
+    },
+    "flows_parsed": { "type": "integer", "minimum": 0 },
+    "flows_inserted": { "type": "integer", "minimum": 0 },
+    "dns_parsed": { "type": "integer", "minimum": 0 },
+    "dns_inserted": { "type": "integer", "minimum": 0 },
+    "raw_logs_in_artifact": {
+      "type": "boolean",
+      "description": "True when a bounded RawToolOutput artifact holds the JSON logs"
+    },
+    "artifact": {
+      "$ref": "#/$defs/artifactRef",
+      "description": "Bounded copy of the produced conn.log/dns.log (JSON lines)"
+    }
+  },
+  "$defs": {
+    "artifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "note", "path"],
+      "properties": {
+        "id": { "type": "string" },
+        "kind": { "enum": ["raw_tool_output", "summary", "pcap", "report", "ioc_export"] },
+        "note": { "type": "string" },
+        "path": { "type": "string" }
+      }
+    }
+  }
+}

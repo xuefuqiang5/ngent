@@ -40,8 +40,26 @@ describe("EventRouter", () => {
       method: "report.generated",
       params: { metadata: { finding_count: 1 } },
     })
+    mock.emit({
+      jsonrpc: "2.0",
+      method: "zeek.processed",
+      params: { flows_parsed: 6, dns_parsed: 8 },
+    })
+    mock.emit({
+      jsonrpc: "2.0",
+      method: "suricata.processed",
+      params: { alerts_parsed: 4 },
+    })
+    mock.emit({ jsonrpc: "2.0", method: "alert.created", params: { alert: { id: "a1" } } })
 
-    expect(seen).toEqual(["flow.created", "dns.observed", "report.generated"])
+    expect(seen).toEqual([
+      "flow.created",
+      "dns.observed",
+      "report.generated",
+      "zeek.processed",
+      "suricata.processed",
+      "alert.created",
+    ])
     expect(router.listEvents().map((event) => event.method)).toEqual(seen)
   })
 })

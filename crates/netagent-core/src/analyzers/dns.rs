@@ -133,7 +133,7 @@ pub fn detect_nxdomain_enumeration(
     Ok(findings)
 }
 
-fn current_time_iso() -> String {
+pub(crate) fn current_time_iso() -> String {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

@@ -1,6 +1,7 @@
 use netagent_models::{AgentMode, ArtifactRef};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::sync::atomic::AtomicBool;
 
 use crate::analyzers::rules::{load_rule_manifests, run_all_rules};
 use crate::reports::markdown::{
@@ -8,7 +9,7 @@ use crate::reports::markdown::{
 };
 use crate::storage::artifact_store::ArtifactStore;
 use crate::storage::sqlite::SqliteStore;
-use crate::tools::{system_shell, tshark};
+use crate::tools::{suricata, system_shell, tshark, zeek};
 
 const DEFAULT_LIST_LIMIT: usize = 12;
 const MAX_LIST_LIMIT: usize = 25;
@@ -277,7 +278,7 @@ impl ToolRegistry {
             ToolDef {
                 id: String::from("dns.detect_anomalies"),
                 description: String::from(
-                    "Run the NXDOMAIN spike rule over stored DNS events and persist any findings. Returns bounded finding summaries.",
+                    "Run every enabled manifest analyzer rule (rules/builtin/*.yaml) over stored evidence and persist any findings. Returns bounded finding summaries.",
                 ),
                 input_schema: object_schema(
                     json!({
@@ -285,12 +286,12 @@ impl ToolRegistry {
                             "type": "number",
                             "minimum": 0.0,
                             "maximum": 1.0,
-                            "description": "NXDOMAIN ratio threshold for an anomaly"
+                            "description": "NXDOMAIN ratio threshold for the spike rule"
                         },
                         "min_queries": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Minimum total DNS queries before a host is considered"
+                            "description": "Minimum total DNS queries before a host is considered by the spike rule"
                         }
                     }),
                     &[],
@@ -300,6 +301,30 @@ impl ToolRegistry {
                 risk: String::from("low"),
                 timeout_ms: Some(5_000),
                 truncate_at: 12,
+            },
+            ToolDef {
+                id: String::from("zeek.process_pcap"),
+                description: String::from(
+                    "Run Zeek (fixed arguments only) over a local pcap file, persist the parsed connection and DNS records, and store a bounded copy of the JSON logs as an artifact. If Zeek is not installed the result explains why and suggests the tshark fallback.",
+                ),
+                input_schema: pcap_path_schema(),
+                output_schema: standard_output_schema(),
+                permissions: Vec::new(),
+                risk: String::from("low"),
+                timeout_ms: Some(70_000),
+                truncate_at: 10,
+            },
+            ToolDef {
+                id: String::from("suricata.process_pcap"),
+                description: String::from(
+                    "Run Suricata (fixed arguments only) over a local pcap file, persist parsed alert, connection, and DNS records, and store a bounded copy of eve.json as an artifact. If Suricata is not installed the result explains why and suggests the tshark fallback.",
+                ),
+                input_schema: pcap_path_schema(),
+                output_schema: standard_output_schema(),
+                permissions: Vec::new(),
+                risk: String::from("low"),
+                timeout_ms: Some(70_000),
+                truncate_at: 10,
             },
             ToolDef {
                 id: String::from("report.generate"),
@@ -484,10 +509,7 @@ impl ToolRegistry {
 
     /// Validate typed `capture.start` input without executing anything.
     /// The permission state machine decides whether a capture may actually run.
-    pub fn validate_capture_input(
-        &self,
-        input: &Value,
-    ) -> Result<CapturePlanIntent, String> {
+    pub fn validate_capture_input(&self, input: &Value) -> Result<CapturePlanIntent, String> {
         let object = validate_object_input(input)?;
         reject_unknown_fields(object, &["interface", "filter", "duration"])?;
         let interface = object
@@ -542,6 +564,7 @@ impl ToolRegistry {
         artifact_store: &mut ArtifactStore,
         finding_counter: &mut u64,
         record_counter: &mut u64,
+        abort: &AtomicBool,
     ) -> Result<ToolResult, String> {
         validate_context(context)?;
         let object = validate_object_input(input)?;
@@ -602,8 +625,7 @@ impl ToolRegistry {
                 let path = required_path_field(object, "path")?;
                 let dns_events = tshark::extract_dns(std::path::Path::new(&path))?;
                 let samples = dns_events.iter().take(5).cloned().collect::<Vec<_>>();
-                let inserted =
-                    insert_dns_with_ids(&dns_events, sqlite_store, record_counter)?;
+                let inserted = insert_dns_with_ids(&dns_events, sqlite_store, record_counter)?;
                 Ok(ToolResult {
                     title: String::from("DNS events extracted"),
                     summary: format!(
@@ -621,6 +643,121 @@ impl ToolRegistry {
                     artifacts: Vec::new(),
                     truncated: dns_events.len() > samples.len(),
                     raw_output_artifact: None,
+                })
+            }
+            "zeek.process_pcap" => {
+                let path = required_path_field(object, "path")?;
+                let output =
+                    zeek::process_pcap(std::path::Path::new(&path), artifact_store, abort)?;
+                if !output.binary_available || output.exit_code != Some(0) {
+                    return Ok(ToolResult {
+                        title: String::from("Zeek processing did not run"),
+                        summary: output.preview.clone(),
+                        structured: json!({
+                            "status": "unavailable",
+                            "path": path,
+                            "binary_available": output.binary_available,
+                            "exit_code": output.exit_code,
+                            "timed_out": output.timed_out,
+                            "stderr_bounded": output.stderr,
+                            "preview": output.preview,
+                            "fallback": ["tshark.extract_flows", "tshark.extract_dns"],
+                        }),
+                        artifacts: Vec::new(),
+                        truncated: false,
+                        raw_output_artifact: None,
+                    });
+                }
+                let flows = output.flows;
+                let dns_events = output.dns_events;
+                let flow_count = flows.len();
+                let dns_count = dns_events.len();
+                let flow_inserted = insert_flows_with_ids(&flows, sqlite_store, record_counter)?;
+                let dns_inserted = insert_dns_with_ids(&dns_events, sqlite_store, record_counter)?;
+                Ok(ToolResult {
+                    title: String::from("Zeek logs processed"),
+                    summary: format!(
+                        "Zeek parsed {flow_count} connection(s) and {dns_count} DNS event(s) from {path}; inserted {flow_inserted} flow(s) and {dns_inserted} DNS event(s). Bounded JSON logs are stored as an artifact.",
+                    ),
+                    structured: json!({
+                        "status": "ok",
+                        "path": path,
+                        "flows_parsed": flow_count,
+                        "flows_inserted": flow_inserted,
+                        "dns_parsed": dns_count,
+                        "dns_inserted": dns_inserted,
+                        "preview": output.preview,
+                        "raw_logs_in_artifact": true,
+                    }),
+                    artifacts: output.log_artifact.iter().cloned().collect::<Vec<_>>(),
+                    truncated: false,
+                    raw_output_artifact: output.log_artifact,
+                })
+            }
+            "suricata.process_pcap" => {
+                let path = required_path_field(object, "path")?;
+                let output =
+                    suricata::process_pcap(std::path::Path::new(&path), artifact_store, abort)?;
+                if !output.binary_available || output.exit_code != Some(0) {
+                    return Ok(ToolResult {
+                        title: String::from("Suricata processing did not run"),
+                        summary: output.preview.clone(),
+                        structured: json!({
+                            "status": "unavailable",
+                            "path": path,
+                            "binary_available": output.binary_available,
+                            "exit_code": output.exit_code,
+                            "timed_out": output.timed_out,
+                            "stderr_bounded": output.stderr,
+                            "preview": output.preview,
+                            "fallback": ["tshark.extract_flows", "tshark.extract_dns"],
+                        }),
+                        artifacts: Vec::new(),
+                        truncated: false,
+                        raw_output_artifact: None,
+                    });
+                }
+                let mut alerts = output.alerts;
+                let mut flows = output.flows;
+                let mut dns_events = output.dns_events;
+                let alert_count = alerts.len();
+                let flow_count = flows.len();
+                let dns_count = dns_events.len();
+                for alert in &mut alerts {
+                    *record_counter += 1;
+                    alert.id = format!("alert_{record_counter:04}");
+                }
+                for flow in &mut flows {
+                    *record_counter += 1;
+                    flow.id = format!("flow_{record_counter:04}");
+                }
+                for event in &mut dns_events {
+                    *record_counter += 1;
+                    event.id = format!("dns_{record_counter:04}");
+                }
+                let alert_inserted = sqlite_store.insert_alerts(&alerts)?;
+                let flow_inserted = sqlite_store.insert_flows(&flows)?;
+                let dns_inserted = sqlite_store.insert_dns_events(&dns_events)?;
+                Ok(ToolResult {
+                    title: String::from("Suricata eve.json processed"),
+                    summary: format!(
+                        "Suricata parsed {alert_count} alert(s), {flow_count} connection(s), and {dns_count} DNS event(s) from {path}; inserted {alert_inserted}/{flow_inserted}/{dns_inserted}. Bounded eve.json is stored as an artifact.",
+                    ),
+                    structured: json!({
+                        "status": "ok",
+                        "path": path,
+                        "alerts_parsed": alert_count,
+                        "alerts_inserted": alert_inserted,
+                        "flows_parsed": flow_count,
+                        "flows_inserted": flow_inserted,
+                        "dns_parsed": dns_count,
+                        "dns_inserted": dns_inserted,
+                        "preview": output.preview,
+                        "raw_logs_in_artifact": true,
+                    }),
+                    artifacts: output.log_artifact.iter().cloned().collect::<Vec<_>>(),
+                    truncated: false,
+                    raw_output_artifact: output.log_artifact,
                 })
             }
             "dns.detect_anomalies" => {
@@ -725,7 +862,9 @@ impl ToolRegistry {
                     title: String::from("IOC export written"),
                     summary: format!(
                         "IOC export written with {} findings, {} flows, and {} DNS events. Full document stored as an artifact.",
-                        evidence_bundle.finding_count, evidence_bundle.flow_count, evidence_bundle.dns_event_count
+                        evidence_bundle.finding_count,
+                        evidence_bundle.flow_count,
+                        evidence_bundle.dns_event_count
                     ),
                     structured: json!({
                         "status": "ok",
@@ -751,11 +890,21 @@ impl ToolRegistry {
     /// Validate typed `respond.propose_firewall_rule` input without executing
     /// anything. Produces the proposal intent that the permission state
     /// machine turns into a high-risk typed-confirmation request.
-    pub fn validate_firewall_rule_input(&self, input: &Value) -> Result<FirewallRuleProposal, String> {
+    pub fn validate_firewall_rule_input(
+        &self,
+        input: &Value,
+    ) -> Result<FirewallRuleProposal, String> {
         let object = validate_object_input(input)?;
         reject_unknown_fields(
             object,
-            &["finding_id", "target", "port", "protocol", "action", "reason"],
+            &[
+                "finding_id",
+                "target",
+                "port",
+                "protocol",
+                "action",
+                "reason",
+            ],
         )?;
         let target = object
             .get("target")
@@ -800,7 +949,9 @@ impl ToolRegistry {
             .get("reason")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| String::from("reason must be a non-empty string describing the evidence"))?
+            .ok_or_else(|| {
+                String::from("reason must be a non-empty string describing the evidence")
+            })?
             .trim()
             .to_string();
         let finding_id = object
@@ -973,9 +1124,8 @@ fn parse_pcap_into_store(
     record_counter: &mut u64,
 ) -> Result<ParsedPcapCounts, String> {
     let pcap_path = std::path::Path::new(path);
-    let flows = tshark::extract_flows(pcap_path).map_err(|message| {
-        format!("failed to extract flows from {path}: {message}")
-    })?;
+    let flows = tshark::extract_flows(pcap_path)
+        .map_err(|message| format!("failed to extract flows from {path}: {message}"))?;
     let dns_events = tshark::extract_dns(pcap_path)
         .map_err(|message| format!("failed to extract DNS events from {path}: {message}"))?;
     let flow_count = flows.len();
@@ -1206,13 +1356,15 @@ mod tests {
             .filter_map(|schema| schema.pointer("/function/name").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 16);
         assert!(names.contains(&"flow_list"));
         assert!(names.contains(&"system_shell"));
         assert!(names.contains(&"artifact_summary"));
         assert!(names.contains(&"capture_start"));
         assert!(names.contains(&"pcap_open"));
         assert!(names.contains(&"dns_detect_anomalies"));
+        assert!(names.contains(&"zeek_process_pcap"));
+        assert!(names.contains(&"suricata_process_pcap"));
         assert!(names.contains(&"report_generate"));
         assert!(names.contains(&"ioc_export"));
         assert!(names.contains(&"respond_propose_firewall_rule"));
@@ -1271,18 +1423,34 @@ mod tests {
         assert_eq!(valid.port, Some(53));
         assert_eq!(valid.action, "block");
 
-        assert!(registry
-            .validate_firewall_rule_input(&json!({ "target": "10.0.0.8", "action": "drop", "reason": "x" }))
-            .is_err());
-        assert!(registry
-            .validate_firewall_rule_input(&json!({ "target": "not-an-ip", "action": "block", "reason": "x" }))
-            .is_err());
-        assert!(registry
-            .validate_firewall_rule_input(&json!({ "target": "10.0.0.8/99", "action": "block", "reason": "x" }))
-            .is_err());
-        assert!(registry
-            .validate_firewall_rule_input(&json!({ "target": "10.0.0.8", "action": "block", "reason": "" }))
-            .is_err());
+        assert!(
+            registry
+                .validate_firewall_rule_input(
+                    &json!({ "target": "10.0.0.8", "action": "drop", "reason": "x" })
+                )
+                .is_err()
+        );
+        assert!(
+            registry
+                .validate_firewall_rule_input(
+                    &json!({ "target": "not-an-ip", "action": "block", "reason": "x" })
+                )
+                .is_err()
+        );
+        assert!(
+            registry
+                .validate_firewall_rule_input(
+                    &json!({ "target": "10.0.0.8/99", "action": "block", "reason": "x" })
+                )
+                .is_err()
+        );
+        assert!(
+            registry
+                .validate_firewall_rule_input(
+                    &json!({ "target": "10.0.0.8", "action": "block", "reason": "" })
+                )
+                .is_err()
+        );
         assert!(registry
             .validate_firewall_rule_input(&json!({ "target": "10.0.0.8", "action": "block", "reason": "x", "shell": "rm -rf /" }))
             .is_err());
@@ -1318,15 +1486,21 @@ mod tests {
             .expect("valid capture input");
         assert_eq!(plan.interface, "en0");
         assert_eq!(plan.duration, 7);
-        assert!(registry
-            .validate_capture_input(&json!({ "interface": "en0", "duration": 60 }))
-            .is_err());
-        assert!(registry
-            .validate_capture_input(&json!({ "interface": "", "duration": 5 }))
-            .is_err());
-        assert!(registry
-            .validate_capture_input(&json!({ "interface": "en0", "shell": "ls" }))
-            .is_err());
+        assert!(
+            registry
+                .validate_capture_input(&json!({ "interface": "en0", "duration": 60 }))
+                .is_err()
+        );
+        assert!(
+            registry
+                .validate_capture_input(&json!({ "interface": "", "duration": 5 }))
+                .is_err()
+        );
+        assert!(
+            registry
+                .validate_capture_input(&json!({ "interface": "en0", "shell": "ls" }))
+                .is_err()
+        );
         assert!(registry.validate_capture_input(&json!({})).is_err());
     }
 

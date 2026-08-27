@@ -1,0 +1,12 @@
+id: zeek_conn_syn_scan
+name: Zeek TCP SYN Scan Detection
+description: A host that opens many incomplete TCP connections (Zeek conn_state S0/SYN) toward a large number of distinct targets is flagged as a possible SYN port scan.
+category: scan_detection
+severity: high
+analyzer: zeek_conn_syn_scan
+enabled: true
+params:
+  min_targets: 5
+recommended_actions:
+  - Correlate the scanning host with DNS, flow, and alert evidence before any response.
+  - Verify whether the host is an expected scanner or a compromised endpoint.

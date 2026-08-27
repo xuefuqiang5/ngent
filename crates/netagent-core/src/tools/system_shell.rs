@@ -24,6 +24,23 @@ pub const OPERATIONS: [&str; 6] = [
     "system_info",
 ];
 
+/// Return locally discovered interface names through the same fixed-command,
+/// bounded inspection path used by the Agent tool. This keeps the public
+/// `system.list_interfaces` RPC truthful without exposing raw command output.
+pub fn list_interfaces() -> Result<Vec<String>, String> {
+    let captures = command_specs("interfaces")?
+        .into_iter()
+        .map(run_command)
+        .collect::<Result<Vec<_>, _>>()?;
+    let interfaces = extract_interfaces(&captures);
+    if interfaces.is_empty() {
+        return Err(String::from(
+            "interface inspection completed but no local interfaces were parsed",
+        ));
+    }
+    Ok(interfaces)
+}
+
 #[derive(Debug, Clone)]
 struct CommandSpec {
     label: &'static str,
@@ -171,10 +188,11 @@ pub fn run(
                 && tcpdump_enumerated
                 && capture_device_visible
                 && capture_permission == Some(true);
+            let remediation = capture_permission_remediation(capture_permission);
             (
                 String::from("Capture preflight"),
                 format!(
-                    "Capture preflight for {interface}: interface_exists={interface_exists}, tcpdump_enumerated={tcpdump_enumerated}, capture_device_visible={capture_device_visible}, capture_permission={permission_status}, ready={ready}. No packets were captured.",
+                    "Capture preflight for {interface}: interface_exists={interface_exists}, tcpdump_enumerated={tcpdump_enumerated}, capture_device_visible={capture_device_visible}, capture_permission={permission_status}, ready={ready}. No packets were captured. {remediation}",
                 ),
                 json!({
                     "requested_interface": interface,
@@ -184,6 +202,7 @@ pub fn run(
                     "capture_permission": permission_status,
                     "capture_permission_verified": capture_permission.is_some(),
                     "permission_detail": permission_detail,
+                    "permission_remediation": remediation,
                     "ready": ready,
                     "interfaces": interfaces,
                     "capture_devices": capture_devices,
@@ -217,6 +236,22 @@ pub fn run(
         truncated,
         raw_output_artifact: Some(artifact),
     })
+}
+
+fn capture_permission_remediation(permission: Option<bool>) -> &'static str {
+    if permission != Some(false) {
+        return "No capture-permission remediation is currently required.";
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        "Install the Wireshark ChmodBPF helper with `brew install --cask wireshark-chmodbpf`, then reboot macOS before retrying."
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        "Grant the capture backend the platform-appropriate packet-capture capability before retrying."
+    }
 }
 
 fn command_specs(operation: &str) -> Result<Vec<CommandSpec>, String> {
@@ -336,6 +371,27 @@ fn version_specs() -> Vec<CommandSpec> {
                 "/usr/sbin/tshark",
             ],
             args: &["--version"],
+        },
+        CommandSpec {
+            label: "zeek",
+            candidates: &[
+                "/opt/homebrew/bin/zeek",
+                "/usr/local/bin/zeek",
+                "/usr/bin/zeek",
+                "/bin/zeek",
+                "/opt/zeek/bin/zeek",
+            ],
+            args: &["--version"],
+        },
+        CommandSpec {
+            label: "suricata",
+            candidates: &[
+                "/opt/homebrew/bin/suricata",
+                "/usr/local/bin/suricata",
+                "/usr/bin/suricata",
+                "/bin/suricata",
+            ],
+            args: &["-V"],
         },
     ]
 }

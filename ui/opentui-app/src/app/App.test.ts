@@ -19,6 +19,7 @@ import {
   readRestoredToolEvents,
   reduceEvent,
   summarizeCoreEvent,
+  truncateForDisplay,
 } from "./App"
 
 describe("App event reducer", () => {
@@ -89,6 +90,7 @@ describe("App event reducer", () => {
     expect(sanitizePastedText("你好\r\n网络\u0000")).toBe("你好\n网络")
     expect(removeLastGrapheme("检查网络🧑‍💻")).toBe("检查网络")
     expect(removeLastGrapheme("检查")).toBe("检")
+    expect(truncateForDisplay("A🧑‍💻中文B", 4)).toBe("A🧑‍💻中文...")
   })
 
   test("reduces visible history when the terminal is resized", () => {

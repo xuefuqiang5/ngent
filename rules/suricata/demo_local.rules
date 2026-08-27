@@ -1,0 +1,12 @@
+# NetAgent demo local rules (deterministic demo only).
+#
+# These rules are loaded by the `suricata.process_pcap` connector through a
+# fixed compile-time path (rules/suricata/demo_local.rules). They make the
+# offline demo deterministic: the TCP SYN-scan fixture pcap reliably produces
+# alerts that the suricata_alert_ingest analyzer turns into findings.
+#
+# SIDs use the reserved local-rule range (>= 9000000). Messages are prefixed
+# with NETAGENT_DEMO so they can never be confused with vendor signatures.
+# Production sensors should use a curated ruleset instead of this file.
+
+alert tcp any any -> any any (msg:"NETAGENT_DEMO TCP SYN scan candidate"; flags:S; sid:9000001; rev:1;)

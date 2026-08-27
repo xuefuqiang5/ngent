@@ -7,7 +7,9 @@ NetAgent is a permission-aware terminal agent for network investigation. The dem
 - Rust toolchain
 - Bun
 - `tshark` on `PATH` if you want to parse `.pcap` files
+- Zeek and/or Suricata in an allowlisted standard install path if you want to run the optional Phase 17 sensor connectors
 - System privileges for live capture if you plan to use `tcpdump`-backed capture flows
+- On macOS with Homebrew Wireshark/tcpdump, install the BPF permission helper with `brew install --cask wireshark-chmodbpf`, then reboot before attempting live capture
 
 ## Start the Rust core
 
@@ -65,9 +67,11 @@ The TUI starts and connects to the Rust Core itself; do not start a second Core 
 bun run start
 ```
 
+Conversation history renders inside a bottom-following scroll viewport. Long or multi-round responses are clipped to that viewport while the composer and footer remain fixed; display truncation preserves complete Unicode graphemes.
+
 ## Current agent tools
 
-The model/local planner can call 14 typed tools. All are executed by the Rust Tool Runtime with full session/message/part/call context, and every result is a bounded summary plus structured output and `ArtifactRef` values — raw packet or command output never enters the model context:
+The model/local planner can call 16 typed tools. All are executed by the Rust Tool Runtime with full session/message/part/call context, and every result is a bounded summary plus structured output and `ArtifactRef` values — raw packet or command output never enters the model context:
 
 - `flow.list` / `finding.list` — list up to 25 stored flows/findings.
 - `capture.status` — inspect capture state without starting or stopping capture.
@@ -75,6 +79,7 @@ The model/local planner can call 14 typed tools. All are executed by the Rust To
 - `artifact.list` / `artifact.summary` — list/describe artifact references without raw contents.
 - `capture.start` — request a bounded live capture. The Agent loop pauses and the Core raises a `PermissionRequest` (tool, risk, command preview, interface, filter, duration). `agent.resume` continues the loop after the user decides; rejection feedback makes the Agent replan (offline pcap analysis by default). `capture.stop` is deliberately not an agent tool.
 - `pcap.open` / `tshark.extract_flows` / `tshark.extract_dns` — parse and persist offline pcap evidence.
+- `zeek.process_pcap` / `suricata.process_pcap` — run fixed-argument, time-bounded and abortable offline sensor analysis, persist structured flow/DNS/alert records, and retain bounded raw logs as artifacts. `agent.abort` terminates a running sensor child before any partial logs or records are committed. Missing binaries return a bounded tshark fallback instead of failing the Agent loop.
 - `dns.detect_anomalies` — NXDOMAIN spike rule over stored DNS events; creates `finding.created`.
 - `report.generate` / `ioc.export` — Markdown evidence report and IOC JSON document artifacts.
 - `respond.propose_firewall_rule` — high-risk proposal/preview only. The Agent pauses, the user must type an exact confirmation phrase (e.g. `BLOCK 10.0.0.8`) in the TUI, and approval creates a traceable proposal artifact (finding id + evidence refs, `executed=false`). The firewall is NEVER modified.

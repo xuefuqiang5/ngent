@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::analyzers::dns::{detect_nxdomain_enumeration, detect_nxdomain_spike};
+use crate::analyzers::suricata::ingest_alerts;
+use crate::analyzers::zeek::detect_syn_scan;
 use crate::storage::sqlite::SqliteStore;
 
 /// A declarative analyzer rule manifest loaded from `rules/builtin/*.yaml`.
@@ -123,11 +125,17 @@ pub fn run_rule(
             finding_counter,
             manifest.param_usize("min_nxdomains").unwrap_or(5),
         )?,
+        "zeek_conn_syn_scan" => detect_syn_scan(
+            store,
+            finding_counter,
+            manifest.param_usize("min_targets").unwrap_or(5),
+        )?,
+        "suricata_alert_ingest" => ingest_alerts(store, finding_counter)?,
         other => {
             return Err(format!(
                 "rule {} declares unknown analyzer: {other}",
                 manifest.id
-            ))
+            ));
         }
     };
 
@@ -136,10 +144,7 @@ pub fn run_rule(
             finding.metadata = Value::Object(Default::default());
         }
         if let Some(metadata) = finding.metadata.as_object_mut() {
-            metadata.insert(
-                "rule_id".to_string(),
-                Value::String(manifest.id.clone()),
-            );
+            metadata.insert("rule_id".to_string(), Value::String(manifest.id.clone()));
             metadata.insert(
                 "rule_name".to_string(),
                 Value::String(manifest.name.clone()),

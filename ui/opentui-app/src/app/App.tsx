@@ -419,12 +419,25 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
       <box
         flexDirection="column"
         flexGrow={1}
+        flexShrink={1}
+        minHeight={0}
+        overflow="hidden"
         borderStyle="single"
         borderColor="#1f2937"
         padding={1}
         gap={1}
       >
-        <box flexDirection="column" flexGrow={1} gap={1}>
+        <scrollbox
+          flexGrow={1}
+          flexShrink={1}
+          minHeight={0}
+          scrollY
+          stickyScroll
+          stickyStart="bottom"
+          viewportCulling
+          overflow="hidden"
+          contentOptions={{ flexDirection: "column", gap: 1 }}
+        >
           {recentMessages.map((message) => (
             <ThreadMessage
               key={message.id}
@@ -470,9 +483,9 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
               <text fg="#94a3b8">{truncate(state.sync.error ?? "unknown error", 120)}</text>
             </box>
           ) : null}
-        </box>
+        </scrollbox>
 
-        <box flexDirection="column" marginTop={1} gap={1}>
+        <box flexDirection="column" flexShrink={0} gap={0}>
           <Composer state={state} />
           <text fg="#4b5563">
             Enter send · Backspace edit · Ctrl+R refresh · Esc quit
@@ -1298,10 +1311,16 @@ function severityColor(severity: string): string {
   return "#38bdf8"
 }
 
-function truncate(value: string, max: number): string {
-  if (value.length <= max) return value
-  return `${value.slice(0, max)}...`
+export function truncateForDisplay(value: string, max: number): string {
+  const graphemes = Array.from(
+    new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(value),
+    (entry) => entry.segment,
+  )
+  if (graphemes.length <= max) return value
+  return `${graphemes.slice(0, max).join("")}...`
 }
+
+const truncate = truncateForDisplay
 
 export function upsertChatMessage(
   messages: ChatMessage[],

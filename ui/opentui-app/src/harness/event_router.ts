@@ -44,7 +44,10 @@ export class EventRouter {
       !method.startsWith("dns.") &&
       !method.startsWith("tls.") &&
       !method.startsWith("http.") &&
-      !method.startsWith("report.")
+      !method.startsWith("report.") &&
+      !method.startsWith("alert.") &&
+      !method.startsWith("zeek.") &&
+      !method.startsWith("suricata.")
     ) {
       return
     }

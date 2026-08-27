@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod alert;
 pub mod artifact;
 pub mod dns;
 pub mod evidence_ref;
@@ -11,6 +12,7 @@ pub use agent::{
     AgentMode, Message, MessagePart, MessagePartKind, MessageRole, RunState, Session, Step,
     StepStatus, ToolCall, ToolCallStatus,
 };
+pub use alert::Alert;
 pub use artifact::{ArtifactKind, ArtifactRef};
 pub use dns::{DnsEvent, DnsNxdomainSpike};
 pub use evidence_ref::EvidenceRef;

@@ -239,7 +239,7 @@ fn parse_dns_output(raw: &str) -> Result<Vec<DnsEvent>, String> {
     Ok(events)
 }
 
-fn format_epoch(epoch: f64) -> String {
+pub(crate) fn format_epoch(epoch: f64) -> String {
     if epoch == 0.0 {
         return String::from("1970-01-01T00:00:00Z");
     }

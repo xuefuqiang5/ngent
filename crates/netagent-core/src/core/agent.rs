@@ -73,7 +73,11 @@ pub struct AgentPendingPermission {
 #[derive(Debug, Clone)]
 pub enum ToolOutcome {
     Completed(ToolResult),
-    PermissionPending { request_id: String, summary: String, plan: serde_json::Value },
+    PermissionPending {
+        request_id: String,
+        summary: String,
+        plan: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,8 +154,14 @@ struct LoopResult {
 
 #[derive(Debug, Clone, Copy)]
 enum FallbackMode<'a> {
-    Plain { input: &'a str },
-    Resume { input: &'a str, outcome: &'a Value, outcome_summary: &'a str },
+    Plain {
+        input: &'a str,
+    },
+    Resume {
+        input: &'a str,
+        outcome: &'a Value,
+        outcome_summary: &'a str,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -318,9 +328,7 @@ impl AgentRuntime {
             .unwrap_or(true);
         let session_id = input
             .session_id
-            .unwrap_or_else(|| {
-                Self::next_id("ses", &self.id_namespace, &mut self.session_counter)
-            });
+            .unwrap_or_else(|| Self::next_id("ses", &self.id_namespace, &mut self.session_counter));
 
         let mut record = self
             .sessions
@@ -362,7 +370,8 @@ impl AgentRuntime {
                 .iter()
                 .map(|call| Self::canonical_tool_name(&call.function.name)),
         );
-        let mut goal_analysis = Self::build_goal_analysis(&input.input, input.mode, candidate_tools);
+        let mut goal_analysis =
+            Self::build_goal_analysis(&input.input, input.mode, candidate_tools);
         let mut plan_message = self.build_message(
             &session_id,
             MessageRole::Assistant,
@@ -373,7 +382,12 @@ impl AgentRuntime {
 
         let llm_config = self.llm.clone();
         let mut provider_messages = llm_config.as_ref().map(|config| {
-            self.build_provider_history(config, &record.messages, &input.context_summary, &goal_analysis)
+            self.build_provider_history(
+                config,
+                &record.messages,
+                &input.context_summary,
+                &goal_analysis,
+            )
         });
         let fallback_calls = if llm_config.is_none() {
             preview_calls
@@ -562,10 +576,9 @@ impl AgentRuntime {
 
         let mut waiting_part_index = None;
         for (index, message) in record.messages.iter().enumerate().rev() {
-            let waiting = message
-                .parts
-                .iter()
-                .any(|part| part.kind == MessagePartKind::ToolCall && part_waits_for_permission(part));
+            let waiting = message.parts.iter().any(|part| {
+                part.kind == MessagePartKind::ToolCall && part_waits_for_permission(part)
+            });
             if waiting {
                 waiting_part_index = Some(index);
                 break;
@@ -582,8 +595,7 @@ impl AgentRuntime {
                 .iter()
                 .find(|part| part.kind == MessagePartKind::ToolCall)
                 .expect("waiting part exists");
-            let content: Value =
-                serde_json::from_str(&part.content).unwrap_or_else(|_| json!({}));
+            let content: Value = serde_json::from_str(&part.content).unwrap_or_else(|_| json!({}));
             (
                 content
                     .get("provider_call_id")
@@ -658,7 +670,12 @@ impl AgentRuntime {
         // (the tool result for the waiting call) so every assistant tool_calls
         // message has its matching tool message.
         let mut provider_messages = llm_config.as_ref().map(|config| {
-            self.build_provider_history(config, &record.messages, &input.context_summary, &goal_analysis)
+            self.build_provider_history(
+                config,
+                &record.messages,
+                &input.context_summary,
+                &goal_analysis,
+            )
         });
         let fallback_calls = if llm_config.is_none() {
             Self::fallback_resume_plan(&input)
@@ -687,7 +704,9 @@ impl AgentRuntime {
                 artifacts: input
                     .outcome
                     .get("artifact")
-                    .and_then(|artifact| serde_json::from_value::<ArtifactRef>(artifact.clone()).ok())
+                    .and_then(|artifact| {
+                        serde_json::from_value::<ArtifactRef>(artifact.clone()).ok()
+                    })
                     .map(|artifact| vec![artifact])
                     .unwrap_or_default(),
                 truncated: false,
@@ -699,11 +718,7 @@ impl AgentRuntime {
             self,
             &mut record,
             &step.id,
-            &format!(
-                "{}_{}",
-                step.id.trim_start_matches("step_"),
-                step.attempt
-            ),
+            &format!("{}_{}", step.id.trim_start_matches("step_"), step.attempt),
             llm_config.as_ref(),
             &mut provider_messages,
             fallback_calls,
@@ -908,7 +923,11 @@ impl AgentRuntime {
             } else {
                 ModelAction::Text(match fallback_mode {
                     FallbackMode::Plain { input } => Self::fallback_response(input, &activities),
-                    FallbackMode::Resume { input, outcome, outcome_summary } => {
+                    FallbackMode::Resume {
+                        input,
+                        outcome,
+                        outcome_summary,
+                    } => {
                         Self::fallback_resume_response(input, outcome, outcome_summary, &activities)
                     }
                 })
@@ -963,16 +982,10 @@ impl AgentRuntime {
                         }
 
                         total_calls += 1;
-                        let call_message_id = Self::next_id(
-                            "msg",
-                            &self.id_namespace,
-                            &mut self.message_counter,
-                        );
-                        let call_part_id = Self::next_id(
-                            "part",
-                            &self.id_namespace,
-                            &mut self.part_counter,
-                        );
+                        let call_message_id =
+                            Self::next_id("msg", &self.id_namespace, &mut self.message_counter);
+                        let call_part_id =
+                            Self::next_id("part", &self.id_namespace, &mut self.part_counter);
                         let call_id = format!("call_{}_{}", call_id_prefix, total_calls);
                         let request = AgentToolExecutionRequest {
                             session_id: record.session.id.clone(),
@@ -1087,6 +1100,7 @@ impl AgentRuntime {
                                 });
                             }
                             Err(message) => {
+                                let tool_aborted = message.contains("aborted");
                                 let result = ToolResult::bounded_error(&tool_name, &message);
                                 let tool_call = ToolCall {
                                     id: call_id.clone(),
@@ -1094,7 +1108,11 @@ impl AgentRuntime {
                                     step_id: step_id.to_string(),
                                     tool_name: tool_name.clone(),
                                     input: arguments.to_string(),
-                                    status: ToolCallStatus::Error,
+                                    status: if tool_aborted {
+                                        ToolCallStatus::Aborted
+                                    } else {
+                                        ToolCallStatus::Error
+                                    },
                                 };
                                 let call_part = MessagePart {
                                     id: call_part_id,
@@ -1104,7 +1122,11 @@ impl AgentRuntime {
                                         "provider_call_id": call.id,
                                         "tool_name": tool_name,
                                         "input": arguments,
-                                        "status": ToolCallStatus::Error,
+                                        "status": if tool_aborted {
+                                            ToolCallStatus::Aborted
+                                        } else {
+                                            ToolCallStatus::Error
+                                        },
                                     })
                                     .to_string(),
                                 };
@@ -1141,6 +1163,12 @@ impl AgentRuntime {
                                     tool_call,
                                     result,
                                 });
+                                if tool_aborted {
+                                    let reason = String::from("Agent turn aborted by the user.");
+                                    aborted = true;
+                                    stopped = Some(reason);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1327,10 +1355,7 @@ impl AgentRuntime {
             if let Some(interface) = interface {
                 arguments["interface"] = json!(interface);
             }
-            return Self::fallback_plan_from_pairs(
-                step_id,
-                vec![("system.shell", arguments)],
-            );
+            return Self::fallback_plan_from_pairs(step_id, vec![("system.shell", arguments)]);
         }
 
         if Self::wants_live_evidence(&lower, input) {
@@ -1466,9 +1491,7 @@ impl AgentRuntime {
 
         let heading = if chinese {
             match status {
-                "approved" | "completed" => {
-                    "抓包已获批准，已用抓取到的 pcap 完成离线分析。"
-                }
+                "approved" | "completed" => "抓包已获批准，已用抓取到的 pcap 完成离线分析。",
                 "rejected" => "实时抓包权限被拒绝；已改用本地 pcap 离线分析。",
                 _ => "抓包启动失败；已尝试用离线证据继续调查。",
             }
@@ -1477,8 +1500,12 @@ impl AgentRuntime {
                 "approved" | "completed" => {
                     "The capture was approved and the resulting pcap has been analyzed offline."
                 }
-                "rejected" => "Live capture was rejected; the investigation switched to offline pcap analysis.",
-                _ => "The capture could not start; the investigation fell back to offline evidence.",
+                "rejected" => {
+                    "Live capture was rejected; the investigation switched to offline pcap analysis."
+                }
+                _ => {
+                    "The capture could not start; the investigation fell back to offline evidence."
+                }
             }
         };
 
@@ -1542,21 +1569,58 @@ impl AgentRuntime {
         }
         Self::contains_any(
             lower,
-            &["抓包", "capture", "packet", "live", "实时", "当前网络", "现在网络", "流量", "可疑", "异常"],
-        ) || Self::contains_any(input, &["抓包", "实时", "当前网络", "现在网络", "流量", "可疑", "异常"])
+            &[
+                "抓包",
+                "capture",
+                "packet",
+                "live",
+                "实时",
+                "当前网络",
+                "现在网络",
+                "流量",
+                "可疑",
+                "异常",
+            ],
+        ) || Self::contains_any(
+            input,
+            &[
+                "抓包",
+                "实时",
+                "当前网络",
+                "现在网络",
+                "流量",
+                "可疑",
+                "异常",
+            ],
+        )
     }
 
     fn wants_respond_action(lower: &str) -> bool {
         Self::contains_any(
             lower,
-            &["firewall", "防火墙", "封禁", "阻断", "block", "响应", "respond"],
+            &[
+                "firewall",
+                "防火墙",
+                "封禁",
+                "阻断",
+                "block",
+                "响应",
+                "respond",
+            ],
         )
     }
 
-    fn system_inspection_request(lower: &str, input: &str) -> Option<(&'static str, Option<String>)> {
+    fn system_inspection_request(
+        lower: &str,
+        input: &str,
+    ) -> Option<(&'static str, Option<String>)> {
         if Self::contains_any(
             lower,
-            &["capture preflight", "capture permission", "capture readiness"],
+            &[
+                "capture preflight",
+                "capture permission",
+                "capture readiness",
+            ],
         ) || Self::contains_any(input, &["抓包预检", "抓包权限", "抓包条件", "能否抓包"])
         {
             return match Self::extract_interface_name(input) {
@@ -1566,7 +1630,13 @@ impl AgentRuntime {
         }
         if Self::contains_any(
             lower,
-            &["interface", "network adapter", "network device", "网卡", "网络接口"],
+            &[
+                "interface",
+                "network adapter",
+                "network device",
+                "网卡",
+                "网络接口",
+            ],
         ) || Self::contains_any(input, &["网卡", "网络接口"])
         {
             return Some(("interfaces", None));
@@ -1581,13 +1651,17 @@ impl AgentRuntime {
         {
             return Some(("listeners", None));
         }
-        if Self::contains_any(lower, &["tcpdump version", "tshark version", "tool version"])
-            || Self::contains_any(input, &["工具版本", "是否安装", "安装了吗"])
+        if Self::contains_any(
+            lower,
+            &["tcpdump version", "tshark version", "tool version"],
+        ) || Self::contains_any(input, &["工具版本", "是否安装", "安装了吗"])
         {
             return Some(("tool_versions", None));
         }
-        if Self::contains_any(lower, &["system info", "kernel version", "operating system"])
-            || Self::contains_any(input, &["系统信息", "内核版本", "操作系统版本"])
+        if Self::contains_any(
+            lower,
+            &["system info", "kernel version", "operating system"],
+        ) || Self::contains_any(input, &["系统信息", "内核版本", "操作系统版本"])
         {
             return Some(("system_info", None));
         }
@@ -1615,8 +1689,7 @@ impl AgentRuntime {
     fn extract_ip_target(input: &str) -> Option<String> {
         input
             .split(|character: char| {
-                !(character.is_ascii_alphanumeric()
-                    || matches!(character, '.' | ':' | '/'))
+                !(character.is_ascii_alphanumeric() || matches!(character, '.' | ':' | '/'))
             })
             .find(|token| Self::looks_like_ip_or_cidr(token))
             .map(str::to_string)
@@ -1646,9 +1719,9 @@ impl AgentRuntime {
         }
         let octets = value.split('.').collect::<Vec<_>>();
         octets.len() == 4
-            && octets.iter().all(|octet| {
-                octet.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
-            })
+            && octets
+                .iter()
+                .all(|octet| octet.parse::<u16>().map(|n| n <= 255).unwrap_or(false))
     }
 
     fn extract_pcap_path(input: &str) -> Option<String> {
@@ -1731,6 +1804,8 @@ impl AgentRuntime {
             "pcap_open" => String::from("pcap.open"),
             "tshark_extract_flows" => String::from("tshark.extract_flows"),
             "tshark_extract_dns" => String::from("tshark.extract_dns"),
+            "zeek_process_pcap" => String::from("zeek.process_pcap"),
+            "suricata_process_pcap" => String::from("suricata.process_pcap"),
             "dns_detect_anomalies" => String::from("dns.detect_anomalies"),
             "report_generate" => String::from("report.generate"),
             "ioc_export" => String::from("ioc.export"),
@@ -1767,19 +1842,32 @@ impl AgentRuntime {
             ),
         ];
 
-        for message in messages
+        let persisted = messages
             .iter()
-            .rev()
-            .take(20)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            if let Some(provider_message) = ChatMessage::from_persisted(message) {
-                provider_messages.push(provider_message);
-            }
-        }
+            .filter_map(ChatMessage::from_persisted)
+            .collect::<Vec<_>>();
+        provider_messages.extend(Self::provider_history_tail(persisted, 20));
         provider_messages
+    }
+
+    fn provider_history_tail(messages: Vec<ChatMessage>, limit: usize) -> Vec<ChatMessage> {
+        if messages.len() <= limit {
+            return messages;
+        }
+
+        let mut start = messages.len().saturating_sub(limit);
+        // A provider tool result is only valid immediately after the assistant
+        // message which declared its tool call. Expand the bounded suffix by
+        // one message rather than splitting that protocol pair.
+        if messages
+            .get(start)
+            .is_some_and(|message| message.role == "tool")
+            && start > 0
+            && messages[start - 1].tool_calls.is_some()
+        {
+            start -= 1;
+        }
+        messages.into_iter().skip(start).collect()
     }
 
     fn complete_with_llm(
@@ -1915,7 +2003,10 @@ impl AgentRuntime {
                 continue;
             }
             if let Some(message) = data.strip_prefix("{\"error\"") {
-                return Err(format!("llm stream error: {}", Self::truncate_chars(message, MAX_LLM_ERROR_BODY_CHARS)));
+                return Err(format!(
+                    "llm stream error: {}",
+                    Self::truncate_chars(message, MAX_LLM_ERROR_BODY_CHARS)
+                ));
             }
             let chunk: ChatStreamChunk = serde_json::from_str(data)
                 .map_err(|error| format!("failed to parse llm stream chunk: {error}"))?;
@@ -1988,7 +2079,8 @@ impl AgentRuntime {
         }
     }
 
-    fn truncate_chars(value: &str, limit: usize) -> String {        let mut characters = value.chars();
+    fn truncate_chars(value: &str, limit: usize) -> String {
+        let mut characters = value.chars();
         let truncated = characters.by_ref().take(limit).collect::<String>();
         if characters.next().is_some() {
             format!("{truncated}…")
@@ -2046,17 +2138,10 @@ impl LlmConfig {
             .unwrap_or(60)
             .clamp(5, 300);
         let stream = Self::config_value("NETAGENT_LLM_STREAM")
-            .map(|value| {
-                !matches!(
-                    value.as_str(),
-                    "0" | "false" | "no" | "off" | "disabled"
-                )
-            })
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "no" | "off" | "disabled"))
             .unwrap_or(true);
         let thinking = Self::config_value("NETAGENT_LLM_THINKING")
-            .map(|value| {
-                matches!(value.as_str(), "1" | "true" | "yes" | "on")
-            })
+            .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
 
         Some(Self {
@@ -2306,7 +2391,10 @@ mod tests {
             .run_turn_with_tools(input(), &[], |_| unreachable!("no tool expected"))
             .expect("second turn");
 
-        assert_ne!(first_turn.session_started.id, second_turn.session_started.id);
+        assert_ne!(
+            first_turn.session_started.id,
+            second_turn.session_started.id
+        );
         assert_ne!(first_turn.user_message.id, second_turn.user_message.id);
         assert_ne!(first_turn.step.id, second_turn.step.id);
     }
@@ -2319,6 +2407,35 @@ mod tests {
         assert_eq!(emitted, "中文");
         assert_eq!(content.chars().count(), MAX_LLM_OUTPUT_CHARS);
         assert!(AgentRuntime::append_bounded_output(&mut content, "ignored").is_empty());
+    }
+
+    #[test]
+    fn provider_history_tail_never_splits_a_tool_call_pair() {
+        let mut messages = vec![ChatMessage::text("user", String::from("old message"))];
+        messages.push(ChatMessage::assistant_tool_calls(vec![ChatToolCall {
+            id: String::from("provider_call_1"),
+            kind: String::from("function"),
+            function: ChatFunctionCall {
+                name: String::from("system_shell"),
+                arguments: String::from(r#"{"operation":"interfaces"}"#),
+            },
+        }]));
+        messages.push(ChatMessage {
+            role: String::from("tool"),
+            content: Some(String::from(r#"{"summary":"interfaces found"}"#)),
+            tool_calls: None,
+            tool_call_id: Some(String::from("provider_call_1")),
+        });
+        messages.extend(
+            (0..19).map(|index| ChatMessage::text("assistant", format!("message {index}"))),
+        );
+
+        let tail = AgentRuntime::provider_history_tail(messages, 20);
+
+        assert_eq!(tail.len(), 21);
+        assert!(tail[0].tool_calls.is_some());
+        assert_eq!(tail[1].role, "tool");
+        assert_eq!(tail[1].tool_call_id.as_deref(), Some("provider_call_1"));
     }
 
     fn read_http_body(stream: &mut TcpStream) -> String {
@@ -2525,10 +2642,12 @@ mod tests {
             .map(|call| call.function.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["system.shell"]);
-        assert!(calls[0]
-            .function
-            .arguments
-            .contains("\"operation\":\"interfaces\""));
+        assert!(
+            calls[0]
+                .function
+                .arguments
+                .contains("\"operation\":\"interfaces\"")
+        );
     }
 
     #[test]
@@ -2536,14 +2655,18 @@ mod tests {
         let calls = AgentRuntime::fallback_plan("检查 en0 的抓包权限", "step_0002b");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "system.shell");
-        assert!(calls[0]
-            .function
-            .arguments
-            .contains("\"operation\":\"capture_preflight\""));
-        assert!(calls[0]
-            .function
-            .arguments
-            .contains("\"interface\":\"en0\""));
+        assert!(
+            calls[0]
+                .function
+                .arguments
+                .contains("\"operation\":\"capture_preflight\"")
+        );
+        assert!(
+            calls[0]
+                .function
+                .arguments
+                .contains("\"interface\":\"en0\"")
+        );
     }
 
     #[test]
@@ -2558,9 +2681,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["pcap.open", "dns.detect_anomalies", "report.generate", "ioc.export"]
+            vec![
+                "pcap.open",
+                "dns.detect_anomalies",
+                "report.generate",
+                "ioc.export"
+            ]
         );
-        assert!(calls[0].function.arguments.contains("/tmp/netagent-demo/dns.pcap"));
+        assert!(
+            calls[0]
+                .function
+                .arguments
+                .contains("/tmp/netagent-demo/dns.pcap")
+        );
     }
 
     #[test]
@@ -2703,16 +2836,52 @@ mod tests {
         );
         assert!(resumed.assistant_message.parts[0].content.contains("离线"));
         assert!(
-            resumed
-                .assistant_message
-                .parts[0]
+            resumed.assistant_message.parts[0]
                 .content
                 .contains("pcap.open")
         );
 
         let session = runtime.sessions.get(&session_id).expect("session stored");
         assert_eq!(session.session.run_state, RunState::Idle);
-        assert_eq!(session.steps.last().expect("last step").status, StepStatus::Completed);
+        assert_eq!(
+            session.steps.last().expect("last step").status,
+            StepStatus::Completed
+        );
+    }
+
+    #[test]
+    fn aborted_tool_marks_call_and_step_aborted() {
+        let mut runtime = AgentRuntime::disabled();
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "pcap_open",
+                "description": "Open pcap",
+                "parameters": { "type": "object" }
+            }
+        })];
+
+        let turn = runtime
+            .run_turn_with_tools(
+                AgentAskInput {
+                    session_id: None,
+                    mode: AgentMode::Observe,
+                    input: String::from("Analyze /tmp/evidence.pcap"),
+                    context_summary: String::from("flows=0"),
+                },
+                &tools,
+                |_| Err(String::from("zeek processing aborted by the user")),
+            )
+            .expect("aborted tool settles as an aborted turn");
+
+        assert_eq!(turn.step.status, StepStatus::Aborted);
+        assert_eq!(turn.final_run_state, RunState::Idle);
+        assert_eq!(turn.tool_activities.len(), 1);
+        assert_eq!(
+            turn.tool_activities[0].tool_call.status,
+            ToolCallStatus::Aborted
+        );
+        assert!(turn.stop_reason.unwrap_or_default().contains("aborted"));
     }
 
     #[test]
@@ -2808,10 +2977,7 @@ mod tests {
 
         assert_eq!(&deltas[..3], &["Hel", "lo from", " stream"]);
         assert!(deltas.contains(&"Final ".to_string()));
-        assert_eq!(
-            turn.assistant_message.parts[0].content,
-            "Final answer."
-        );
+        assert_eq!(turn.assistant_message.parts[0].content, "Final answer.");
         assert_eq!(turn.tool_activities.len(), 1);
         assert_eq!(
             turn.tool_activities[0].tool_call.input,
@@ -2877,16 +3043,16 @@ mod tests {
         let turn = result.expect("aborted turns settle as normal results");
         assert_eq!(turn.step.status, StepStatus::Aborted);
         assert_eq!(turn.final_run_state, RunState::Idle);
-        assert_eq!(turn.stop_reason.as_deref(), Some("Agent turn aborted by the user."));
-        assert!(
-            turn.assistant_message.parts[0]
-                .content
-                .contains("aborted")
+        assert_eq!(
+            turn.stop_reason.as_deref(),
+            Some("Agent turn aborted by the user.")
         );
+        assert!(turn.assistant_message.parts[0].content.contains("aborted"));
     }
 
     #[test]
-    fn repeated_tool_call_guard_stops_the_third_identical_call() {        let mut calls = HashMap::new();
+    fn repeated_tool_call_guard_stops_the_third_identical_call() {
+        let mut calls = HashMap::new();
         let input = json!({ "limit": 5 });
         assert!(!AgentRuntime::repeated_tool_call_exceeded(
             &mut calls,

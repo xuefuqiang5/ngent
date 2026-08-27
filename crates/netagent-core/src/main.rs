@@ -28,7 +28,9 @@ use crate::runtime::tool_registry::{
 };
 use crate::storage::artifact_store::ArtifactStore;
 use crate::storage::sqlite::SqliteStore;
+use crate::tools::suricata::process_pcap as suricata_process_pcap;
 use crate::tools::tshark;
+use crate::tools::zeek::process_pcap as zeek_process_pcap;
 use netagent_models::{
     AgentMode, PermissionDecision, PermissionKind, PermissionMetadata, PermissionReply,
     PermissionReplyKind, PermissionRequest, RiskLevel, RunState, StepStatus, ToolCallStatus,
@@ -104,31 +106,45 @@ struct CoreCounters {
 
 impl CoreState {
     fn permission(&self) -> std::sync::MutexGuard<'_, PermissionManager> {
-        self.permission_manager.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.permission_manager
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn artifacts(&self) -> std::sync::MutexGuard<'_, ArtifactStore> {
-        self.artifact_store.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.artifact_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, SqliteStore> {
-        self.sqlite_store.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.sqlite_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn capture(&self) -> std::sync::MutexGuard<'_, Option<CaptureJob>> {
-        self.capture_job.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.capture_job
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn pending_capture(&self) -> std::sync::MutexGuard<'_, Option<PendingCapture>> {
-        self.pending_capture.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.pending_capture
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn pending_respond(&self) -> std::sync::MutexGuard<'_, Option<PendingRespond>> {
-        self.pending_respond.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.pending_respond
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn counters(&self) -> std::sync::MutexGuard<'_, CoreCounters> {
-        self.counters.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.counters
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn mark_busy(&self) -> bool {
@@ -138,7 +154,8 @@ impl CoreState {
     }
 
     fn mark_idle(&self) {
-        self.agent_busy.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.agent_busy
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -219,9 +236,9 @@ fn run() -> io::Result<()> {
 
     let mut state = CoreState {
         agent_runtime: std::sync::Arc::new(std::sync::Mutex::new(AgentRuntime::from_env())),
-        permission_manager: std::sync::Arc::new(std::sync::Mutex::new(
-            PermissionManager::default(),
-        )),
+        permission_manager: std::sync::Arc::new(
+            std::sync::Mutex::new(PermissionManager::default()),
+        ),
         tool_registry: ToolRegistry,
         artifact_store: std::sync::Arc::new(std::sync::Mutex::new(ArtifactStore::default())),
         sqlite_store: std::sync::Arc::new(std::sync::Mutex::new(sqlite_store)),
@@ -308,6 +325,7 @@ fn run() -> io::Result<()> {
     *state.agent_abort_rx.lock().unwrap() = Some(abort_rx);
 
     let stdin_stdout = stdout.clone();
+    let stdin_abort = state.agent_abort.clone();
     let stdin_thread = std::thread::spawn(move || {
         for line_result in io::stdin().lock().lines() {
             let Ok(line) = line_result else {
@@ -322,7 +340,9 @@ fn run() -> io::Result<()> {
                 let id = serde_json::from_str::<RpcRequest>(&line)
                     .map(|request| request.id)
                     .unwrap_or(Value::Null);
-                let mut out = stdin_stdout.lock().unwrap_or_else(|poison| poison.into_inner());
+                let mut out = stdin_stdout
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
                 let _ = serde_json::to_writer(
                     &mut *out,
                     &RpcResponse {
@@ -338,6 +358,7 @@ fn run() -> io::Result<()> {
                 );
                 let _ = writeln!(out);
                 let _ = out.flush();
+                stdin_abort.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = abort_tx.send(());
                 continue;
             }
@@ -433,11 +454,7 @@ fn run() -> io::Result<()> {
 /// completion. The worker owns a CoreState built from the shared Arc fields,
 /// so the main loop can keep serving read-only requests concurrently. Returns
 /// false (and writes nothing) when another turn is already running.
-fn spawn_turn_worker(
-    state: &mut CoreState,
-    writer: SharedStdout,
-    request: RpcRequest,
-) -> bool {
+fn spawn_turn_worker(state: &mut CoreState, writer: SharedStdout, request: RpcRequest) -> bool {
     if !state.mark_busy() {
         return false;
     }
@@ -583,6 +600,8 @@ fn handle_request<W: Write>(
                 "pcap.summarize",
                 "tshark.extract_flows",
                 "tshark.extract_dns",
+                "zeek.process_pcap",
+                "suricata.process_pcap",
                 "dns.detect_anomalies",
                 "flow.list",
                 "finding.list",
@@ -615,7 +634,10 @@ fn handle_request<W: Write>(
                 "capture.stopped",
                 "pcap.created",
                 "report.generated",
-                "respond.proposal.created"
+                "respond.proposal.created",
+                "zeek.processed",
+                "suricata.processed",
+                "alert.created"
             ],
             "llm": state.agent_runtime.lock().unwrap().llm_status(),
             "agent_tools": state.tool_registry.agent_defs(),
@@ -633,22 +655,23 @@ fn handle_request<W: Write>(
                 "max_capture_duration_secs": 10
             }
         })),
-        "system.list_interfaces" => Ok(json!({
-            "interfaces": [
-                {
-                    "name": "mock0",
-                    "label": "Mock Loopback",
-                    "kind": "loopback",
-                    "addresses": ["127.0.0.1"]
-                },
-                {
-                    "name": "mock1",
-                    "label": "Mock External",
-                    "kind": "ethernet",
-                    "addresses": ["10.0.0.10"]
-                }
-            ]
-        })),
+        "system.list_interfaces" => crate::tools::system_shell::list_interfaces()
+            .map(|interfaces| {
+                json!({
+                    "interfaces": interfaces.into_iter().map(|name| {
+                        json!({
+                            "label": name,
+                            "kind": if name.starts_with("lo") { "loopback" } else { "network" },
+                            "addresses": [],
+                            "name": name,
+                        })
+                    }).collect::<Vec<_>>()
+                })
+            })
+            .map_err(|message| RpcError {
+                code: -32020,
+                message,
+            }),
         "agent.ask" => {
             let input = request
                 .params
@@ -685,7 +708,7 @@ fn handle_request<W: Write>(
                             code: -32010,
                             message,
                         },
-                    ))
+                    ));
                 }
             };
 
@@ -702,7 +725,12 @@ fn handle_request<W: Write>(
             emit_agent_turn_events(writer, &turn, streamed_text)?;
             let mut result = AgentRuntime::build_agent_response(&turn);
             if let Some(pending) = &turn.pending_permission {
-                match finalize_agent_pending_permission(state, writer, &turn.session_finished.id, pending) {
+                match finalize_agent_pending_permission(
+                    state,
+                    writer,
+                    &turn.session_finished.id,
+                    pending,
+                ) {
                     Ok(proposal) => {
                         result["session"]["run_state"] = json!(RunState::WaitingPermission);
                         result["run_state"] = json!(RunState::WaitingPermission);
@@ -743,7 +771,7 @@ fn handle_request<W: Write>(
                                 "no pending agent continuation for session {session_id}"
                             ),
                         },
-                    ))
+                    ));
                 }
                 Err(message) => {
                     return Ok(error_response(
@@ -752,7 +780,7 @@ fn handle_request<W: Write>(
                             code: -32011,
                             message,
                         },
-                    ))
+                    ));
                 }
             };
 
@@ -820,7 +848,9 @@ fn handle_request<W: Write>(
             Ok(result)
         }
         "agent.abort" => {
-            state.agent_abort.store(true, std::sync::atomic::Ordering::Relaxed);
+            state
+                .agent_abort
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(json!({
                 "aborted": true,
                 "run_state": RunState::Canceling,
@@ -842,6 +872,8 @@ fn handle_request<W: Write>(
         "pcap.summarize" => handle_pcap_summarize(state, &request.params),
         "tshark.extract_flows" => handle_tshark_extract_flows(state, writer, &request.params),
         "tshark.extract_dns" => handle_tshark_extract_dns(state, writer, &request.params),
+        "zeek.process_pcap" => handle_zeek_process_pcap(state, writer, &request.params),
+        "suricata.process_pcap" => handle_suricata_process_pcap(state, writer, &request.params),
         "dns.detect_anomalies" => handle_dns_detect_anomalies(state, writer, &request.params),
         "flow.list" => handle_flow_list(state),
         "finding.list" => handle_finding_list(state),
@@ -1333,6 +1365,59 @@ fn emit_tool_domain_events<W: Write>(
                 json!({ "count": structured.get("dns_parsed") }),
             )?;
         }
+        "zeek.process_pcap" => {
+            if let Some(artifact) = structured.get("artifact") {
+                emit_event(writer, "artifact.created", json!({ "artifact": artifact }))?;
+            }
+            if structured.get("status").and_then(Value::as_str) == Some("ok") {
+                emit_event(
+                    writer,
+                    "zeek.processed",
+                    json!({
+                        "path": structured.get("path"),
+                        "flows_parsed": structured.get("flows_parsed"),
+                        "dns_parsed": structured.get("dns_parsed"),
+                    }),
+                )?;
+                emit_event(
+                    writer,
+                    "flow.created",
+                    json!({ "count": structured.get("flows_parsed") }),
+                )?;
+                emit_event(
+                    writer,
+                    "dns.observed",
+                    json!({ "count": structured.get("dns_parsed") }),
+                )?;
+            }
+        }
+        "suricata.process_pcap" => {
+            if let Some(artifact) = structured.get("artifact") {
+                emit_event(writer, "artifact.created", json!({ "artifact": artifact }))?;
+            }
+            if structured.get("status").and_then(Value::as_str) == Some("ok") {
+                emit_event(
+                    writer,
+                    "suricata.processed",
+                    json!({
+                        "path": structured.get("path"),
+                        "alerts_parsed": structured.get("alerts_parsed"),
+                        "flows_parsed": structured.get("flows_parsed"),
+                        "dns_parsed": structured.get("dns_parsed"),
+                    }),
+                )?;
+                emit_event(
+                    writer,
+                    "flow.created",
+                    json!({ "count": structured.get("flows_parsed") }),
+                )?;
+                emit_event(
+                    writer,
+                    "dns.observed",
+                    json!({ "count": structured.get("dns_parsed") }),
+                )?;
+            }
+        }
         "dns.detect_anomalies" => {
             if let Some(findings) = structured.get("findings").and_then(Value::as_array) {
                 for finding in findings.iter().take(10) {
@@ -1406,7 +1491,9 @@ fn handle_tool_mock_large_output<W: Write>(
         input: json!({ "query": query }).to_string(),
         status: ToolCallStatus::Pending,
     };
-    state.store().insert_tool_call(&tool_call)
+    state
+        .store()
+        .insert_tool_call(&tool_call)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -1439,7 +1526,9 @@ fn handle_tool_mock_large_output<W: Write>(
     })?;
 
     tool_call.status = ToolCallStatus::Running;
-    state.store().insert_tool_call(&tool_call)
+    state
+        .store()
+        .insert_tool_call(&tool_call)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -1451,7 +1540,9 @@ fn handle_tool_mock_large_output<W: Write>(
         {
             Ok(result) => result,
             Err(message) => {
-                let _ = state.store().update_tool_call_status(&call_id, ToolCallStatus::Error);
+                let _ = state
+                    .store()
+                    .update_tool_call_status(&call_id, ToolCallStatus::Error);
                 let _ = emit_event(
                     writer,
                     "agent.tool.failed",
@@ -1502,7 +1593,9 @@ fn handle_tool_mock_large_output<W: Write>(
     }
 
     tool_call.status = ToolCallStatus::Completed;
-    state.store().insert_tool_call(&tool_call)
+    state
+        .store()
+        .insert_tool_call(&tool_call)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -1537,10 +1630,14 @@ fn emit_event<W: Write>(writer: &mut W, method: &str, params: Value) -> io::Resu
 
 fn build_agent_context_summary(state: &CoreState) -> String {
     let flow_count = state.store().flow_count().unwrap_or(0);
-    let dns_count = state.store().list_dns_events()
+    let dns_count = state
+        .store()
+        .list_dns_events()
         .map(|items| items.len())
         .unwrap_or(0);
-    let finding_count = state.store().list_findings()
+    let finding_count = state
+        .store()
+        .list_findings()
         .map(|items| items.len())
         .unwrap_or(0);
     let artifact_count = state.artifacts().list_artifacts().len();
@@ -1588,7 +1685,9 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    state.agent_abort.store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .agent_abort
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     let abort = state.agent_abort.clone();
     let mut streamed_any = false;
     let mut streamed_text = false;
@@ -1604,6 +1703,7 @@ where
             &mut permission_seq,
             permission_seed,
             execution,
+            abort.as_ref(),
         )
     };
     let mut on_text_delta = |delta: &str| {
@@ -1653,9 +1753,15 @@ fn run_agent_ask_turn<W: Write>(
     capture_status: &Value,
     writer: &mut W,
 ) -> Result<(AgentTurn, bool), String> {
-    run_agent_turn_with(state, tool_schemas, capture_status, writer, |runtime, tools, abort, delta, executor| {
-        runtime.run_turn_with_tools_streaming(input, tools, abort, delta, executor)
-    })
+    run_agent_turn_with(
+        state,
+        tool_schemas,
+        capture_status,
+        writer,
+        |runtime, tools, abort, delta, executor| {
+            runtime.run_turn_with_tools_streaming(input, tools, abort, delta, executor)
+        },
+    )
 }
 
 fn run_agent_resume_turn<W: Write>(
@@ -1665,9 +1771,15 @@ fn run_agent_resume_turn<W: Write>(
     capture_status: &Value,
     writer: &mut W,
 ) -> Result<(AgentTurn, bool), String> {
-    run_agent_turn_with(state, tool_schemas, capture_status, writer, |runtime, tools, abort, delta, executor| {
-        runtime.continue_turn_with_tools_streaming(input, tools, abort, delta, executor)
-    })
+    run_agent_turn_with(
+        state,
+        tool_schemas,
+        capture_status,
+        writer,
+        |runtime, tools, abort, delta, executor| {
+            runtime.continue_turn_with_tools_streaming(input, tools, abort, delta, executor)
+        },
+    )
 }
 
 fn run_agent_tool(
@@ -1680,6 +1792,7 @@ fn run_agent_tool(
     permission_seq: &mut u64,
     permission_seed: u128,
     execution: &AgentToolExecutionRequest,
+    abort: &std::sync::atomic::AtomicBool,
 ) -> Result<ToolOutcome, String> {
     let context = ToolContext {
         session_id: execution.session_id.clone(),
@@ -1735,6 +1848,8 @@ fn run_agent_tool(
         "pcap.open"
         | "tshark.extract_flows"
         | "tshark.extract_dns"
+        | "zeek.process_pcap"
+        | "suricata.process_pcap"
         | "dns.detect_anomalies"
         | "report.generate"
         | "ioc.export" => tool_registry
@@ -1746,6 +1861,7 @@ fn run_agent_tool(
                 artifact_store,
                 finding_counter,
                 tool_id_counter,
+                abort,
             )
             .map(ToolOutcome::Completed),
         _ => tool_registry
@@ -1799,7 +1915,10 @@ fn finalize_agent_respond_permission<W: Write>(
             .and_then(Value::as_str)
             .unwrap_or("0.0.0.0")
             .to_string(),
-        port: plan.get("port").and_then(Value::as_u64).map(|port| port as u16),
+        port: plan
+            .get("port")
+            .and_then(Value::as_u64)
+            .map(|port| port as u16),
         protocol: plan
             .get("protocol")
             .and_then(Value::as_str)
@@ -1817,7 +1936,9 @@ fn finalize_agent_respond_permission<W: Write>(
             .to_string(),
     };
 
-    state.store().insert_tool_call(&pending.tool_call)
+    state
+        .store()
+        .insert_tool_call(&pending.tool_call)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -1829,9 +1950,10 @@ fn finalize_agent_respond_permission<W: Write>(
         session_id: session_id.to_string(),
         permission: PermissionKind::ModifyFirewall,
         patterns: vec![proposal.target.clone(), proposal.action.clone()],
-        always: vec![
-            format!("modify_firewall:{}:{}", proposal.target, proposal.action),
-        ],
+        always: vec![format!(
+            "modify_firewall:{}:{}",
+            proposal.target, proposal.action
+        )],
         risk: RiskLevel::High,
         metadata: PermissionMetadata {
             tool: String::from("respond.propose_firewall_rule"),
@@ -1881,11 +2003,14 @@ fn finalize_agent_respond_permission<W: Write>(
         code: -32011,
         message: format!("failed to encode pending respond: {error}"),
     })?;
-    if let Err(message) =
-        state.store().save_pending_permission(&request, &continuation)
+    if let Err(message) = state
+        .store()
+        .save_pending_permission(&request, &continuation)
     {
         state.permission().remove_pending(&request.id);
-        let _ = state.store().update_tool_call_status(&pending.tool_call.id, ToolCallStatus::Error);
+        let _ = state
+            .store()
+            .update_tool_call_status(&pending.tool_call.id, ToolCallStatus::Error);
         return Err(RpcError {
             code: -32011,
             message,
@@ -1930,7 +2055,9 @@ fn finalize_agent_capture_permission<W: Write>(
         .unwrap_or(10)
         .clamp(1, 10);
 
-    state.store().insert_tool_call(&pending.tool_call)
+    state
+        .store()
+        .insert_tool_call(&pending.tool_call)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -1987,11 +2114,14 @@ fn finalize_agent_capture_permission<W: Write>(
                     code: -32011,
                     message: format!("failed to encode pending capture: {error}"),
                 })?;
-            if let Err(message) =
-                state.store().save_pending_permission(&request, &continuation)
+            if let Err(message) = state
+                .store()
+                .save_pending_permission(&request, &continuation)
             {
                 state.permission().remove_pending(&request.id);
-                let _ = state.store().update_tool_call_status(&pending.tool_call.id, ToolCallStatus::Error);
+                let _ = state
+                    .store()
+                    .update_tool_call_status(&pending.tool_call.id, ToolCallStatus::Error);
                 return Err(RpcError {
                     code: -32011,
                     message,
@@ -2065,7 +2195,9 @@ fn build_resume_outcome_summary(payload: &Value) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if feedback.is_empty() {
-                String::from("The action was rejected by the user. Revise the plan or use a different approach.")
+                String::from(
+                    "The action was rejected by the user. Revise the plan or use a different approach.",
+                )
             } else {
                 format!("The action was rejected by the user. Feedback: {feedback}")
             }
@@ -2075,7 +2207,9 @@ fn build_resume_outcome_summary(payload: &Value) -> String {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
-            format!("The action could not be completed: {message}. Fall back to a safer alternative.")
+            format!(
+                "The action could not be completed: {message}. Fall back to a safer alternative."
+            )
         }
     }
 }
@@ -2100,7 +2234,11 @@ fn restore_agent_sessions(state: &mut CoreState) -> Result<usize, String> {
     }
 
     let count = records.len();
-    state.agent_runtime.lock().unwrap().restore_sessions(records);
+    state
+        .agent_runtime
+        .lock()
+        .unwrap()
+        .restore_sessions(records);
     Ok(count)
 }
 
@@ -2162,7 +2300,9 @@ fn set_session_run_state(
     session_id: &str,
     run_state: RunState,
 ) -> Result<(), RpcError> {
-    state.store().update_session_run_state(session_id, run_state)
+    state
+        .store()
+        .update_session_run_state(session_id, run_state)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2191,11 +2331,10 @@ fn persist_agent_turn(store: &SqliteStore, turn: &AgentTurn) -> Result<(), Strin
 }
 
 fn handle_session_list(state: &CoreState) -> Result<Value, RpcError> {
-    let sessions = state.store().list_sessions()
-        .map_err(|message| RpcError {
-            code: -32011,
-            message,
-        })?;
+    let sessions = state.store().list_sessions().map_err(|message| RpcError {
+        code: -32011,
+        message,
+    })?;
     Ok(json!({
         "sessions": sessions
     }))
@@ -2203,7 +2342,9 @@ fn handle_session_list(state: &CoreState) -> Result<Value, RpcError> {
 
 fn handle_session_get(state: &CoreState, params: &Value) -> Result<Value, RpcError> {
     let session_id = required_string_param(params, "session_id")?;
-    let session = state.store().load_session(session_id)
+    let session = state
+        .store()
+        .load_session(session_id)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2212,17 +2353,23 @@ fn handle_session_get(state: &CoreState, params: &Value) -> Result<Value, RpcErr
             code: -32012,
             message: format!("session not found: {session_id}"),
         })?;
-    let messages = state.store().load_messages(session_id)
+    let messages = state
+        .store()
+        .load_messages(session_id)
         .map_err(|message| RpcError {
             code: -32011,
             message,
         })?;
-    let steps = state.store().load_steps(session_id)
+    let steps = state
+        .store()
+        .load_steps(session_id)
         .map_err(|message| RpcError {
             code: -32011,
             message,
         })?;
-    let tool_calls = state.store().load_tool_calls(session_id)
+    let tool_calls = state
+        .store()
+        .load_tool_calls(session_id)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2231,7 +2378,9 @@ fn handle_session_get(state: &CoreState, params: &Value) -> Result<Value, RpcErr
         .iter()
         .flat_map(|message| message.parts.iter().cloned())
         .collect::<Vec<_>>();
-    let pending_permissions = state.store().list_pending_permissions()
+    let pending_permissions = state
+        .store()
+        .list_pending_permissions()
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2253,7 +2402,9 @@ fn handle_session_get(state: &CoreState, params: &Value) -> Result<Value, RpcErr
 
 fn handle_message_list(state: &CoreState, params: &Value) -> Result<Value, RpcError> {
     let session_id = required_string_param(params, "session_id")?;
-    let messages = state.store().load_messages(session_id)
+    let messages = state
+        .store()
+        .load_messages(session_id)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2358,7 +2509,9 @@ fn request_capture_permission<W: Write>(
         .to_string(),
         status: ToolCallStatus::Pending,
     };
-    state.store().insert_tool_call(&tool_call)
+    state
+        .store()
+        .insert_tool_call(&tool_call)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2380,10 +2533,14 @@ fn request_capture_permission<W: Write>(
                     code: -32011,
                     message: format!("failed to encode pending capture: {error}"),
                 })?;
-            if let Err(message) = state.store().save_pending_permission(&request, &continuation)
+            if let Err(message) = state
+                .store()
+                .save_pending_permission(&request, &continuation)
             {
                 state.permission().remove_pending(&request.id);
-                let _ = state.store().update_tool_call_status(&request.tool.call_id, ToolCallStatus::Error);
+                let _ = state
+                    .store()
+                    .update_tool_call_status(&request.tool.call_id, ToolCallStatus::Error);
                 return Err(RpcError {
                     code: -32011,
                     message,
@@ -2460,13 +2617,10 @@ fn handle_permission_reply<W: Write>(
     };
     let persisted_reply = reply.clone();
 
-    let outcome = state
-        .permission()
-        .reply(reply)
-        .ok_or_else(|| RpcError {
-            code: -32602,
-            message: format!("pending request not found: {request_id}"),
-        })?;
+    let outcome = state.permission().reply(reply).ok_or_else(|| RpcError {
+        code: -32602,
+        message: format!("pending request not found: {request_id}"),
+    })?;
 
     if outcome.decision == PermissionDecision::Pending {
         // Typed confirmation failed: the request stays pending; surface the
@@ -2480,9 +2634,7 @@ fn handle_permission_reply<W: Write>(
     }
 
     if let Err(message) = state.store().resolve_permission(&persisted_reply) {
-        state
-            .permission()
-            .restore_pending(outcome.request.clone());
+        state.permission().restore_pending(outcome.request.clone());
         return Err(RpcError {
             code: -32011,
             message,
@@ -2499,16 +2651,14 @@ fn handle_permission_reply<W: Write>(
     let tool_session_id = outcome.request.session_id.clone();
     let tool_name = outcome.request.metadata.tool.clone();
     let result = match outcome.request.permission {
-        PermissionKind::CaptureLive => {
-            handle_capture_permission_outcome(state, writer, outcome)
-        }
-        PermissionKind::ModifyFirewall => {
-            handle_respond_permission_outcome(state, writer, outcome)
-        }
+        PermissionKind::CaptureLive => handle_capture_permission_outcome(state, writer, outcome),
+        PermissionKind::ModifyFirewall => handle_respond_permission_outcome(state, writer, outcome),
     };
 
     if result.is_err() && is_approval {
-        let _ = state.store().update_tool_call_status(&tool_call_id, ToolCallStatus::Error);
+        let _ = state
+            .store()
+            .update_tool_call_status(&tool_call_id, ToolCallStatus::Error);
         let _ = set_session_run_state(state, &tool_session_id, RunState::Error);
         let _ = emit_event(
             writer,
@@ -2545,12 +2695,19 @@ fn handle_capture_permission_outcome<W: Write>(
                     message,
                 })
                 .and_then(|_| {
-                    start_capture_from_pending(state, writer, &outcome.request.id, "approved_always")
+                    start_capture_from_pending(
+                        state,
+                        writer,
+                        &outcome.request.id,
+                        "approved_always",
+                    )
                 })
         }
         PermissionDecision::Rejected => {
             *state.pending_capture() = None;
-            state.store().update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Aborted)
+            state
+                .store()
+                .update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Aborted)
                 .map_err(|message| RpcError {
                     code: -32011,
                     message,
@@ -2607,28 +2764,26 @@ fn handle_respond_permission_outcome<W: Write>(
                 .filter(|pending| pending.request_id == outcome.request.id)
                 .ok_or_else(|| RpcError {
                     code: -32602,
-                    message: format!("pending respond continuation not found: {}", outcome.request.id),
+                    message: format!(
+                        "pending respond continuation not found: {}",
+                        outcome.request.id
+                    ),
                 })?;
-            let (artifact, proposal) = build_firewall_proposal_artifact(
-                state,
-                &pending.proposal,
-            )
-            .map_err(|message| RpcError {
+            let (artifact, proposal) = build_firewall_proposal_artifact(state, &pending.proposal)
+                .map_err(|message| RpcError {
                 code: -32015,
                 message,
             })?;
-            state.store().update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Completed)
+            state
+                .store()
+                .update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Completed)
                 .map_err(|message| RpcError {
                     code: -32011,
                     message,
                 })?;
             set_session_run_state(state, &outcome.request.session_id, RunState::Idle)?;
 
-            let _ = emit_event(
-                writer,
-                "artifact.created",
-                json!({ "artifact": artifact }),
-            );
+            let _ = emit_event(writer, "artifact.created", json!({ "artifact": artifact }));
             let _ = emit_event(
                 writer,
                 "respond.proposal.created",
@@ -2674,7 +2829,9 @@ fn handle_respond_permission_outcome<W: Write>(
         }
         PermissionDecision::Rejected => {
             *state.pending_respond() = None;
-            state.store().update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Aborted)
+            state
+                .store()
+                .update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Aborted)
                 .map_err(|message| RpcError {
                     code: -32011,
                     message,
@@ -2727,7 +2884,9 @@ fn build_firewall_proposal_artifact(
     let mut finding_ref = String::from("(none)");
     if let Some(finding_id) = &proposal.finding_id {
         finding_ref = finding_id.clone();
-        if let Some(finding) = state.store().load_finding_by_id(finding_id)
+        if let Some(finding) = state
+            .store()
+            .load_finding_by_id(finding_id)
             .map_err(|message| format!("failed to load finding: {message}"))?
         {
             finding_title = finding.title.clone();
@@ -2739,7 +2898,9 @@ fn build_firewall_proposal_artifact(
             }
         }
     }
-    for flow in state.store().list_flows()
+    for flow in state
+        .store()
+        .list_flows()
         .map_err(|message| format!("failed to list flows: {message}"))?
         .into_iter()
         .filter(|flow| flow.src_ip == proposal.target || flow.dst_ip == proposal.target)
@@ -2756,7 +2917,10 @@ fn build_firewall_proposal_artifact(
         .port
         .map(|port| port.to_string())
         .unwrap_or_else(|| "any".to_string());
-    let protocol = proposal.protocol.clone().unwrap_or_else(|| "any".to_string());
+    let protocol = proposal
+        .protocol
+        .clone()
+        .unwrap_or_else(|| "any".to_string());
     let content = format!(
         "# Firewall Rule Proposal (preview only)\n\n\
          - Status: proposed (NOT executed)\n\
@@ -2932,7 +3096,9 @@ fn start_capture_job<W: Write>(
     })?;
 
     let pcap_path = capture_dir.join(format!("{capture_id}.pcap"));
-    state.store().update_tool_call_status(tool_call_id, ToolCallStatus::Running)
+    state
+        .store()
+        .update_tool_call_status(tool_call_id, ToolCallStatus::Running)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2940,7 +3106,9 @@ fn start_capture_job<W: Write>(
     let child = match spawn_tcpdump(interface, filter, &pcap_path) {
         Ok(child) => child,
         Err(error) => {
-            let _ = state.store().update_tool_call_status(tool_call_id, ToolCallStatus::Error);
+            let _ = state
+                .store()
+                .update_tool_call_status(tool_call_id, ToolCallStatus::Error);
             let _ = state.store().save_agent_resume(
                 session_id,
                 &json!({
@@ -3040,14 +3208,29 @@ fn spawn_tcpdump(interface: &str, filter: &str, pcap_path: &PathBuf) -> Result<C
         if let Some(mut handle) = child.stderr.take() {
             let _ = handle.read_to_string(&mut stderr);
         }
-        return Err(if stderr.trim().is_empty() {
+        let message = if stderr.trim().is_empty() {
             String::from("tcpdump exited immediately")
         } else {
             stderr.trim().to_string()
-        });
+        };
+        return Err(capture_start_error(&message, interface));
     }
 
     Ok(child)
+}
+
+fn capture_start_error(message: &str, interface: &str) -> String {
+    #[cfg(target_os = "macos")]
+    if message.contains("Permission denied")
+        || message.contains("Operation not permitted")
+        || message.contains("You don't have permission")
+    {
+        return format!(
+            "capture permission denied for {interface}: {message}. Install the Wireshark ChmodBPF helper (`brew install --cask wireshark-chmodbpf`), reboot macOS, and retry. NetAgent will not bypass BPF permissions with an embedded sudo prompt."
+        );
+    }
+
+    format!("failed to start capture on {interface}: {message}")
 }
 
 fn reconcile_capture_state<W: Write>(state: &mut CoreState, writer: &mut W) -> io::Result<()> {
@@ -3057,7 +3240,11 @@ fn reconcile_capture_state<W: Write>(state: &mut CoreState, writer: &mut W) -> i
         None => false,
     };
 
-    let job = if should_finalize { state.capture().take() } else { None };
+    let job = if should_finalize {
+        state.capture().take()
+    } else {
+        None
+    };
     if let Some(job) = job {
         let _ = finalize_capture_job(state, writer, job, "completed")?;
     }
@@ -3079,7 +3266,9 @@ fn finalize_capture_job<W: Write>(
         job.id, job.interface, job.filter
     );
     let artifact = state.artifacts().register_pcap(&job.pcap_path, &note);
-    state.store().update_tool_call_status(&job.tool_call_id, ToolCallStatus::Completed)
+    state
+        .store()
+        .update_tool_call_status(&job.tool_call_id, ToolCallStatus::Completed)
         .map_err(io::Error::other)?;
     set_session_run_state(state, &job.session_id, RunState::Idle)
         .map_err(|error| io::Error::other(error.message))?;
@@ -3177,13 +3366,14 @@ fn handle_pcap_open<W: Write>(
     let flow_count = flows.len();
     let dns_count = dns_events.len();
 
-    let flow_inserted = state.store().insert_flows(&flows)
-        .map_err(|e| RpcError {
-            code: -32007,
-            message: e,
-        })?;
+    let flow_inserted = state.store().insert_flows(&flows).map_err(|e| RpcError {
+        code: -32007,
+        message: e,
+    })?;
 
-    let dns_inserted = state.store().insert_dns_events(&dns_events)
+    let dns_inserted = state
+        .store()
+        .insert_dns_events(&dns_events)
         .map_err(|e| RpcError {
             code: -32007,
             message: e,
@@ -3310,11 +3500,10 @@ fn handle_tshark_extract_flows<W: Write>(
         flow.id = next_counter_id("flow", &mut state.counters().tool);
     }
 
-    let inserted = state.store().insert_flows(&flows)
-        .map_err(|e| RpcError {
-            code: -32007,
-            message: e,
-        })?;
+    let inserted = state.store().insert_flows(&flows).map_err(|e| RpcError {
+        code: -32007,
+        message: e,
+    })?;
 
     let _ = emit_event(
         writer,
@@ -3355,7 +3544,9 @@ fn handle_tshark_extract_dns<W: Write>(
         event.id = next_counter_id("dns", &mut state.counters().tool);
     }
 
-    let inserted = state.store().insert_dns_events(&dns_events)
+    let inserted = state
+        .store()
+        .insert_dns_events(&dns_events)
         .map_err(|e| RpcError {
             code: -32007,
             message: e,
@@ -3375,6 +3566,292 @@ fn handle_tshark_extract_dns<W: Write>(
     }))
 }
 
+// ── Phase 17: zeek.process_pcap / suricata.process_pcap ──
+
+fn handle_zeek_process_pcap<W: Write>(
+    state: &mut CoreState,
+    writer: &mut W,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let path = params
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError {
+            code: -32602,
+            message: String::from("path is required"),
+        })?;
+    let pcap_path = std::path::Path::new(path);
+    if !pcap_path.exists() {
+        return Err(RpcError {
+            code: -32602,
+            message: format!("pcap file not found: {path}"),
+        });
+    }
+
+    state
+        .agent_abort
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let abort = state.agent_abort.clone();
+    let output = zeek_process_pcap(pcap_path, &mut state.artifacts(), abort.as_ref()).map_err(
+        |message| RpcError {
+            code: -32007,
+            message: format!("failed to run zeek: {message}"),
+        },
+    )?;
+    if !output.binary_available || output.exit_code != Some(0) {
+        let _ = emit_event(
+            writer,
+            "zeek.processed",
+            json!({
+                "path": path,
+                "binary_available": output.binary_available,
+                "exit_code": output.exit_code,
+                "timed_out": output.timed_out,
+            }),
+        );
+        return Ok(json!({
+            "status": "unavailable",
+            "path": path,
+            "binary_available": output.binary_available,
+            "exit_code": output.exit_code,
+            "timed_out": output.timed_out,
+            "stderr_bounded": output.stderr,
+            "preview": output.preview,
+            "fallback": ["tshark.extract_flows", "tshark.extract_dns"],
+        }));
+    }
+
+    let mut flows = output.flows;
+    let mut dns_events = output.dns_events;
+    for flow in &mut flows {
+        flow.id = next_counter_id("flow", &mut state.counters().tool);
+    }
+    for event in &mut dns_events {
+        event.id = next_counter_id("dns", &mut state.counters().tool);
+    }
+    let flow_count = flows.len();
+    let dns_count = dns_events.len();
+    let flow_inserted = state
+        .store()
+        .insert_flows(&flows)
+        .map_err(|message| RpcError {
+            code: -32007,
+            message,
+        })?;
+    let dns_inserted = state
+        .store()
+        .insert_dns_events(&dns_events)
+        .map_err(|message| RpcError {
+            code: -32007,
+            message,
+        })?;
+
+    if let Some(artifact) = &output.log_artifact {
+        let _ = emit_event(writer, "artifact.created", json!({ "artifact": artifact }));
+    }
+    emit_event(
+        writer,
+        "zeek.processed",
+        json!({
+            "path": path,
+            "flows_parsed": flow_count,
+            "flows_inserted": flow_inserted,
+            "dns_parsed": dns_count,
+            "dns_inserted": dns_inserted,
+        }),
+    )
+    .map_err(|error| RpcError {
+        code: -32001,
+        message: format!("failed to emit zeek.processed: {error}"),
+    })?;
+    for flow in flows.iter().take(20) {
+        let _ = emit_event(
+            writer,
+            "flow.created",
+            json!({
+                "flow": {
+                    "id": flow.id,
+                    "src_ip": flow.src_ip,
+                    "dst_ip": flow.dst_ip,
+                    "src_port": flow.src_port,
+                    "dst_port": flow.dst_port,
+                    "protocol": flow.protocol,
+                    "state": flow.state,
+                }
+            }),
+        );
+    }
+    for event in dns_events.iter().take(20) {
+        let _ = emit_event(
+            writer,
+            "dns.observed",
+            json!({
+                "dns_event": {
+                    "id": event.id,
+                    "src_ip": event.src_ip,
+                    "query_name": event.query_name,
+                    "query_type": event.query_type,
+                    "response_code": event.response_code,
+                }
+            }),
+        );
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "path": path,
+        "flows_parsed": flow_count,
+        "flows_inserted": flow_inserted,
+        "dns_parsed": dns_count,
+        "dns_inserted": dns_inserted,
+        "preview": output.preview,
+        "raw_logs_in_artifact": output.log_artifact.is_some(),
+        "artifact": output.log_artifact,
+    }))
+}
+
+fn handle_suricata_process_pcap<W: Write>(
+    state: &mut CoreState,
+    writer: &mut W,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let path = params
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError {
+            code: -32602,
+            message: String::from("path is required"),
+        })?;
+    let pcap_path = std::path::Path::new(path);
+    if !pcap_path.exists() {
+        return Err(RpcError {
+            code: -32602,
+            message: format!("pcap file not found: {path}"),
+        });
+    }
+
+    state
+        .agent_abort
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let abort = state.agent_abort.clone();
+    let output = suricata_process_pcap(pcap_path, &mut state.artifacts(), abort.as_ref()).map_err(
+        |message| RpcError {
+            code: -32007,
+            message: format!("failed to run suricata: {message}"),
+        },
+    )?;
+    if !output.binary_available || output.exit_code != Some(0) {
+        let _ = emit_event(
+            writer,
+            "suricata.processed",
+            json!({
+                "path": path,
+                "binary_available": output.binary_available,
+                "exit_code": output.exit_code,
+                "timed_out": output.timed_out,
+            }),
+        );
+        return Ok(json!({
+            "status": "unavailable",
+            "path": path,
+            "binary_available": output.binary_available,
+            "exit_code": output.exit_code,
+            "timed_out": output.timed_out,
+            "stderr_bounded": output.stderr,
+            "preview": output.preview,
+            "fallback": ["tshark.extract_flows", "tshark.extract_dns"],
+        }));
+    }
+
+    let mut alerts = output.alerts;
+    let mut flows = output.flows;
+    let mut dns_events = output.dns_events;
+    for alert in &mut alerts {
+        alert.id = next_counter_id("alert", &mut state.counters().tool);
+    }
+    for flow in &mut flows {
+        flow.id = next_counter_id("flow", &mut state.counters().tool);
+    }
+    for event in &mut dns_events {
+        event.id = next_counter_id("dns", &mut state.counters().tool);
+    }
+    let alert_count = alerts.len();
+    let flow_count = flows.len();
+    let dns_count = dns_events.len();
+    let alert_inserted = state
+        .store()
+        .insert_alerts(&alerts)
+        .map_err(|message| RpcError {
+            code: -32007,
+            message,
+        })?;
+    let flow_inserted = state
+        .store()
+        .insert_flows(&flows)
+        .map_err(|message| RpcError {
+            code: -32007,
+            message,
+        })?;
+    let dns_inserted = state
+        .store()
+        .insert_dns_events(&dns_events)
+        .map_err(|message| RpcError {
+            code: -32007,
+            message,
+        })?;
+
+    if let Some(artifact) = &output.log_artifact {
+        let _ = emit_event(writer, "artifact.created", json!({ "artifact": artifact }));
+    }
+    emit_event(
+        writer,
+        "suricata.processed",
+        json!({
+            "path": path,
+            "alerts_parsed": alert_count,
+            "alerts_inserted": alert_inserted,
+            "flows_parsed": flow_count,
+            "dns_parsed": dns_count,
+        }),
+    )
+    .map_err(|error| RpcError {
+        code: -32001,
+        message: format!("failed to emit suricata.processed: {error}"),
+    })?;
+    for alert in alerts.iter().take(20) {
+        let _ = emit_event(
+            writer,
+            "alert.created",
+            json!({
+                "alert": {
+                    "id": alert.id,
+                    "signature": alert.signature,
+                    "severity": alert.severity,
+                    "category": alert.category,
+                    "src_ip": alert.src_ip,
+                    "dest_ip": alert.dest_ip,
+                    "dest_port": alert.dest_port,
+                    "protocol": alert.protocol,
+                }
+            }),
+        );
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "path": path,
+        "alerts_parsed": alert_count,
+        "alerts_inserted": alert_inserted,
+        "flows_parsed": flow_count,
+        "flows_inserted": flow_inserted,
+        "dns_parsed": dns_count,
+        "dns_inserted": dns_inserted,
+        "preview": output.preview,
+        "raw_logs_in_artifact": output.log_artifact.is_some(),
+        "artifact": output.log_artifact,
+    }))
+}
+
 // ── Phase 7: dns.detect_anomalies ──
 
 fn handle_dns_detect_anomalies<W: Write>(
@@ -3391,9 +3868,10 @@ fn handle_dns_detect_anomalies<W: Write>(
             .iter_mut()
             .find(|manifest| manifest.id == "dns_nxdomain_spike")
         {
-            spike
-                .params
-                .insert("threshold_ratio".to_string(), json!(threshold.clamp(0.0, 1.0)));
+            spike.params.insert(
+                "threshold_ratio".to_string(),
+                json!(threshold.clamp(0.0, 1.0)),
+            );
         }
     }
     if let Some(min) = params.get("min_queries").and_then(Value::as_u64) {
@@ -3475,10 +3953,12 @@ fn handle_report_generate<W: Write>(
         .and_then(Value::as_str)
         .unwrap_or("NetAgent Report");
 
-    let input = collect_report_input(&state.store(), &state.artifacts(), title)
-        .map_err(|message| RpcError {
-            code: -32009,
-            message,
+    let input =
+        collect_report_input(&state.store(), &state.artifacts(), title).map_err(|message| {
+            RpcError {
+                code: -32009,
+                message,
+            }
         })?;
     let (content, metadata) = build_markdown_report(&input);
     let artifact = state
@@ -3578,10 +4058,12 @@ fn build_ioc_export_document(
     store: &SqliteStore,
     artifact_store: &ArtifactStore,
 ) -> Result<IocExportDocument, RpcError> {
-    let input = collect_report_input(store, artifact_store, "NetAgent IOC Export")
-        .map_err(|message| RpcError {
-            code: -32009,
-            message,
+    let input =
+        collect_report_input(store, artifact_store, "NetAgent IOC Export").map_err(|message| {
+            RpcError {
+                code: -32009,
+                message,
+            }
         })?;
     let evidence_bundle = build_evidence_bundle_metadata(&input);
 
@@ -3609,6 +4091,16 @@ fn write_message<W: Write, T: Serialize>(writer: &mut W, message: &T) -> io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_permission_error_explains_chmodbpf_remediation() {
+        let message = capture_start_error("/dev/bpf0: Permission denied", "en0");
+        assert!(message.contains("capture permission denied for en0"));
+        assert!(message.contains("wireshark-chmodbpf"));
+        assert!(message.contains("reboot"));
+        assert!(message.contains("will not bypass BPF permissions"));
+    }
     use crate::analyzers::dns::detect_nxdomain_spike;
     use netagent_models::{ArtifactKind, DnsEvent, EvidenceRef};
     use std::process::Command;
@@ -3759,16 +4251,12 @@ mod tests {
 
     fn test_core_state(db_path: &std::path::Path) -> CoreState {
         CoreState {
-            agent_runtime: std::sync::Arc::new(std::sync::Mutex::new(
-                AgentRuntime::disabled(),
-            )),
+            agent_runtime: std::sync::Arc::new(std::sync::Mutex::new(AgentRuntime::disabled())),
             permission_manager: std::sync::Arc::new(std::sync::Mutex::new(
                 PermissionManager::default(),
             )),
             tool_registry: ToolRegistry,
-            artifact_store: std::sync::Arc::new(std::sync::Mutex::new(
-                ArtifactStore::default(),
-            )),
+            artifact_store: std::sync::Arc::new(std::sync::Mutex::new(ArtifactStore::default())),
             sqlite_store: std::sync::Arc::new(std::sync::Mutex::new(
                 SqliteStore::open(db_path).expect("open sqlite store"),
             )),
@@ -4343,15 +4831,21 @@ mod tests {
             }),
         );
         assert_eq!(second["session_created"], false);
-        assert!(second["assistant_message"]["id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("msg_") && id.ends_with("_0014")));
-        assert!(second["assistant_message"]["parts"][0]["id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("part_") && id.ends_with("_0014")));
-        assert!(second["step"]["id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("step_") && id.ends_with("_0002")));
+        assert!(
+            second["assistant_message"]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("msg_") && id.ends_with("_0014"))
+        );
+        assert!(
+            second["assistant_message"]["parts"][0]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("part_") && id.ends_with("_0014"))
+        );
+        assert!(
+            second["step"]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("step_") && id.ends_with("_0002"))
+        );
 
         let (messages, _) = call_rpc(
             &mut restored,
@@ -4387,7 +4881,9 @@ mod tests {
         drop(state);
 
         let mut restored = test_core_state(&db_path);
-        restored.store().reconcile_interrupted_runtime()
+        restored
+            .store()
+            .reconcile_interrupted_runtime()
             .expect("reconcile runtime");
         assert_eq!(restore_agent_sessions(&mut restored).expect("sessions"), 1);
         assert_eq!(
@@ -4409,12 +4905,9 @@ mod tests {
         assert_eq!(snapshot["pending_permissions"].as_array().unwrap().len(), 1);
         let stored_calls = snapshot["tool_calls"].as_array().unwrap();
         assert_eq!(stored_calls.len(), 1);
-        assert!(
-            stored_calls.iter().any(|call| {
-                call["tool_name"] == "capture.start"
-                    && call["status"] == "waiting_permission"
-            })
-        );
+        assert!(stored_calls.iter().any(|call| {
+            call["tool_name"] == "capture.start" && call["status"] == "waiting_permission"
+        }));
 
         let (reply, events) = call_rpc(
             &mut restored,
@@ -4695,8 +5188,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|call| call["tool_name"] != "capture.start"
-                    || call["status"] == "aborted")
+                .all(|call| call["tool_name"] != "capture.start" || call["status"] == "aborted")
         );
         assert!(
             events
@@ -4708,11 +5200,7 @@ mod tests {
                 .iter()
                 .any(|event| event["method"] == "finding.created")
         );
-        assert!(
-            events
-                .iter()
-                .any(|event| event["method"] == "pcap.created")
-        );
+        assert!(events.iter().any(|event| event["method"] == "pcap.created"));
         assert!(
             events
                 .iter()
@@ -4740,10 +5228,7 @@ mod tests {
 
         let (findings, _) = call_rpc(&mut state, 5, "finding.list", json!({}));
         assert_eq!(findings["total"], 1);
-        assert_eq!(
-            findings["findings"][0]["category"],
-            "dns_anomaly"
-        );
+        assert_eq!(findings["findings"][0]["category"], "dns_anomaly");
 
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(pcap_path);
@@ -4840,7 +5325,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             tool_names,
-            vec!["pcap.open", "dns.detect_anomalies", "report.generate", "ioc.export"]
+            vec![
+                "pcap.open",
+                "dns.detect_anomalies",
+                "report.generate",
+                "ioc.export"
+            ]
         );
         assert!(
             events
@@ -4903,7 +5393,10 @@ mod tests {
             json!({ "input": format!("请对 {finding_id} 的实体 10.0.0.8 提出防火墙封禁建议") }),
         );
         assert_eq!(proposal["run_state"], "waiting_permission");
-        assert_eq!(proposal["capture_proposal"]["require_typed_confirmation"], true);
+        assert_eq!(
+            proposal["capture_proposal"]["require_typed_confirmation"],
+            true
+        );
         let session_id = proposal["session"]["id"]
             .as_str()
             .expect("session id")
@@ -4983,7 +5476,9 @@ mod tests {
                 .any(|event| event["method"] == "artifact.created")
         );
 
-        let proposal_path = approved["artifact"]["path"].as_str().expect("proposal path");
+        let proposal_path = approved["artifact"]["path"]
+            .as_str()
+            .expect("proposal path");
         let proposal_content = std::fs::read_to_string(proposal_path).expect("read proposal");
         assert!(proposal_content.contains("NOT executed"));
         assert!(proposal_content.contains("10.0.0.8"));
@@ -4996,7 +5491,8 @@ mod tests {
             9,
             "agent.resume",
             json!({ "session_id": session_id }),
-        );        assert_eq!(resumed["run_state"], "idle");
+        );
+        assert_eq!(resumed["run_state"], "idle");
         assert_eq!(
             resumed["tool_calls"].as_array().unwrap()[0]["tool_name"],
             "respond.propose_firewall_rule"

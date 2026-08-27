@@ -1,0 +1,10 @@
+id: suricata_alert_ingest
+name: Suricata Alert Ingest
+description: Turns persisted Suricata alerts into traceable findings, aggregated per distinct signature and endpoint pair.
+category: sensor_alert
+severity: medium
+analyzer: suricata_alert_ingest
+enabled: true
+recommended_actions:
+  - Correlate the alert with flow, DNS, and scan-detection evidence before responding.
+  - Review the signature rule and its revision before proposing any action.

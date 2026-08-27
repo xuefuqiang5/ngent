@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::Path;
 
 use netagent_models::{
-    AgentMode, DnsEvent, Finding, Flow, Message, MessagePart, MessageRole, PermissionReply,
+    AgentMode, Alert, DnsEvent, Finding, Flow, Message, MessagePart, MessageRole, PermissionReply,
     PermissionRequest, RunState, Session, Step, StepStatus, ToolCall, ToolCallStatus,
 };
 use rusqlite::{Connection, params};
@@ -93,6 +93,21 @@ impl SqliteStore {
                     entities TEXT NOT NULL DEFAULT '[]',
                     evidence TEXT NOT NULL DEFAULT '[]',
                     recommended_actions TEXT NOT NULL DEFAULT '[]',
+                    metadata TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    signature TEXT NOT NULL DEFAULT '',
+                    signature_id TEXT NOT NULL DEFAULT '',
+                    severity INTEGER NOT NULL DEFAULT 0,
+                    category TEXT NOT NULL DEFAULT '',
+                    src_ip TEXT NOT NULL DEFAULT '',
+                    src_port INTEGER NOT NULL DEFAULT 0,
+                    dest_ip TEXT NOT NULL DEFAULT '',
+                    dest_port INTEGER NOT NULL DEFAULT 0,
+                    protocol TEXT NOT NULL DEFAULT '',
                     metadata TEXT NOT NULL DEFAULT '{}'
                 );
 
@@ -440,9 +455,7 @@ impl SqliteStore {
     }
 
     /// Distinct NXDOMAIN query names per source host.
-    pub fn nxdomain_qname_counts_by_host(
-        &self,
-    ) -> Result<Vec<(String, usize, usize)>, String> {
+    pub fn nxdomain_qname_counts_by_host(&self) -> Result<Vec<(String, usize, usize)>, String> {
         let mut stmt = self
             .conn
             .prepare(
@@ -545,6 +558,86 @@ impl SqliteStore {
                 row.get::<_, usize>(0)
             })
             .map_err(|e| format!("failed to count findings: {e}"))
+    }
+
+    // ── Alerts ──
+
+    pub fn insert_alerts(&self, alerts: &[Alert]) -> Result<usize, String> {
+        let mut count = 0;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "INSERT OR REPLACE INTO alerts
+                 (id, timestamp, signature, signature_id, severity, category,
+                  src_ip, src_port, dest_ip, dest_port, protocol, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            )
+            .map_err(|e| format!("failed to prepare alert insert: {e}"))?;
+
+        for alert in alerts {
+            stmt.execute(params![
+                alert.id,
+                alert.timestamp,
+                alert.signature,
+                alert.signature_id,
+                alert.severity,
+                alert.category,
+                alert.src_ip,
+                alert.src_port,
+                alert.dest_ip,
+                alert.dest_port,
+                alert.protocol,
+                serde_json::to_string(&alert.metadata).unwrap_or_default(),
+            ])
+            .map_err(|e| format!("failed to insert alert: {e}"))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub fn list_alerts(&self) -> Result<Vec<Alert>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, timestamp, signature, signature_id, severity, category,
+                        src_ip, src_port, dest_ip, dest_port, protocol, metadata
+                 FROM alerts ORDER BY timestamp DESC, id DESC",
+            )
+            .map_err(|e| format!("failed to prepare alert query: {e}"))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let metadata: String = row.get(11)?;
+                Ok(Alert {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    signature: row.get(2)?,
+                    signature_id: row.get(3)?,
+                    severity: row.get(4)?,
+                    category: row.get(5)?,
+                    src_ip: row.get(6)?,
+                    src_port: row.get(7)?,
+                    dest_ip: row.get(8)?,
+                    dest_port: row.get(9)?,
+                    protocol: row.get(10)?,
+                    metadata: serde_json::from_str(&metadata).unwrap_or_default(),
+                })
+            })
+            .map_err(|e| format!("failed to query alerts: {e}"))?;
+
+        let mut alerts = Vec::new();
+        for row in rows {
+            alerts.push(row.map_err(|e| format!("failed to read alert row: {e}"))?);
+        }
+        Ok(alerts)
+    }
+
+    pub fn alert_count(&self) -> Result<usize, String> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM alerts", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .map_err(|e| format!("failed to count alerts: {e}"))
     }
 
     // ── Sessions ──
@@ -1060,12 +1153,13 @@ impl SqliteStore {
         let call = self.max_suffix_from_query("SELECT id FROM tool_calls")?;
         let flow = self.max_suffix_from_query("SELECT id FROM flows")?;
         let dns = self.max_suffix_from_query("SELECT id FROM dns_events")?;
+        let alert = self.max_suffix_from_query("SELECT id FROM alerts")?;
         let finding = self.max_suffix_from_query("SELECT id FROM findings")?;
 
         Ok(PersistentCounters {
             permission,
             capture_or_call: call,
-            tool_data: call.max(flow).max(dns),
+            tool_data: call.max(flow).max(dns).max(alert),
             finding,
         })
     }
@@ -1233,7 +1327,10 @@ impl SqliteStore {
 
     pub fn delete_agent_resume(&self, session_id: &str) -> Result<(), String> {
         self.conn
-            .execute("DELETE FROM agent_resumes WHERE session_id = ?1", [session_id])
+            .execute(
+                "DELETE FROM agent_resumes WHERE session_id = ?1",
+                [session_id],
+            )
             .map_err(|e| format!("failed to delete agent resume: {e}"))?;
         Ok(())
     }
