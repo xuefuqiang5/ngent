@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://netagent.local/schemas/session-list-result.schema.json",
+  "title": "NetAgent session.list result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sessions"],
+  "properties": {
+    "sessions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "mode", "run_state", "max_steps"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "mode": { "const": "observe" },
+          "run_state": {
+            "enum": [
+              "idle",
+              "busy",
+              "waiting_permission",
+              "running_tool",
+              "capturing",
+              "analyzing",
+              "reporting",
+              "retrying",
+              "compacting",
+              "canceling",
+              "error"
+            ]
+          },
+          "max_steps": { "type": "integer", "minimum": 1 }
+        }
+      }
+    }
+  }
+}

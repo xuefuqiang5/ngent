@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://netagent.local/schemas/session-snapshot-result.schema.json",
+  "title": "NetAgent session.get result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "session",
+    "messages",
+    "message_parts",
+    "steps",
+    "tool_calls",
+    "pending_permissions"
+  ],
+  "properties": {
+    "session": { "$ref": "#/$defs/session" },
+    "messages": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/message" }
+    },
+    "message_parts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/messagePart" }
+    },
+    "steps": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/step" }
+    },
+    "tool_calls": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/toolCall" }
+    },
+    "pending_permissions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/permissionRequest" }
+    }
+  },
+  "$defs": {
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "mode", "run_state", "max_steps"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "mode": { "const": "observe" },
+        "run_state": {
+          "enum": [
+            "idle",
+            "busy",
+            "waiting_permission",
+            "running_tool",
+            "capturing",
+            "analyzing",
+            "reporting",
+            "retrying",
+            "compacting",
+            "canceling",
+            "error"
+          ]
+        },
+        "max_steps": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "session_id", "role", "parts"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "session_id": { "type": "string", "minLength": 1 },
+        "role": { "enum": ["user", "assistant", "tool"] },
+        "parts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/messagePart" }
+        }
+      }
+    },
+    "messagePart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "content"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["text", "reasoning", "tool_call", "tool_result"] },
+        "content": { "type": "string" }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "session_id", "status", "attempt"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "session_id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["running", "completed", "failed", "aborted"] },
+        "attempt": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "toolCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "session_id", "step_id", "tool_name", "input", "status"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "session_id": { "type": "string", "minLength": 1 },
+        "step_id": { "type": "string", "minLength": 1 },
+        "tool_name": { "type": "string", "minLength": 1 },
+        "input": { "type": "string" },
+        "status": { "enum": ["pending", "running", "completed", "error", "aborted"] }
+      }
+    },
+    "permissionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "session_id",
+        "permission",
+        "patterns",
+        "always",
+        "risk",
+        "metadata",
+        "tool"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "session_id": { "type": "string", "minLength": 1 },
+        "permission": { "const": "capture_live" },
+        "patterns": { "type": "array", "items": { "type": "string" } },
+        "always": { "type": "array", "items": { "type": "string" } },
+        "risk": { "enum": ["low", "medium", "high"] },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tool", "command_preview", "reason"],
+          "properties": {
+            "tool": { "type": "string" },
+            "command_preview": { "type": "string" },
+            "reason": { "type": "string" }
+          }
+        },
+        "tool": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["message_id", "call_id"],
+          "properties": {
+            "message_id": { "type": "string" },
+            "call_id": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

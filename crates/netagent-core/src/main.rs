@@ -14,13 +14,16 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::analyzers::dns::detect_nxdomain_spike;
-use crate::core::agent::{AgentAskInput, AgentRuntime, AgentTurn, SessionRecord};
+use crate::core::agent::{
+    AgentAskInput, AgentPendingPermission, AgentResumeInput, AgentRuntime, AgentToolActivity,
+    AgentToolExecutionRequest, AgentTurn, SessionRecord, ToolOutcome,
+};
 use crate::core::permissions::{PermissionManager, PermissionOutcome};
 use crate::reports::markdown::{
-    EvidenceBundleMetadata, MarkdownReportInput, build_evidence_bundle_metadata,
-    build_markdown_report,
+    EvidenceBundleMetadata, build_evidence_bundle_metadata, build_markdown_report,
+    collect_report_input,
 };
-use crate::runtime::tool_registry::{ToolContext, ToolRegistry};
+use crate::runtime::tool_registry::{ToolContext, ToolPermissionContext, ToolRegistry};
 use crate::storage::artifact_store::ArtifactStore;
 use crate::storage::sqlite::SqliteStore;
 use crate::tools::tshark;
@@ -29,7 +32,7 @@ use netagent_models::{
     PermissionReplyKind, PermissionRequest, RiskLevel, RunState, StepStatus, ToolCallStatus,
     ToolRef,
 };
-use netagent_models::{ArtifactRef, DnsEvent, Finding, Flow};
+use netagent_models::{ArtifactRef, DnsEvent, Finding, Flow, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -82,10 +85,11 @@ struct CoreState {
     finding_counter: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingCapture {
     request_id: String,
     session_id: String,
+    tool_call_id: String,
     interface: String,
     filter: String,
     duration_secs: u64,
@@ -95,6 +99,8 @@ struct PendingCapture {
 struct CaptureJob {
     id: String,
     session_id: String,
+    tool_call_id: String,
+    request_id: String,
     interface: String,
     filter: String,
     duration_secs: u64,
@@ -103,12 +109,26 @@ struct CaptureJob {
     child: Child,
 }
 
-#[derive(Debug, Clone)]
-struct AgentCapturePlan {
-    interface: String,
-    filter: String,
+#[derive(Debug, Clone, Copy)]
+struct CapturePermissionInput<'a> {
+    session_id: &'a str,
+    interface: &'a str,
+    filter: &'a str,
     duration_secs: u64,
-    reason: String,
+    reason: &'a str,
+    message_id: &'a str,
+    step_id: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CaptureStartInput<'a> {
+    session_id: &'a str,
+    interface: &'a str,
+    filter: &'a str,
+    duration_secs: u64,
+    approval_status: &'a str,
+    tool_call_id: &'a str,
+    request_id: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,12 +152,8 @@ fn run() -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
 
-    let mut db_path = std::env::temp_dir();
-    db_path.push("netagent-captures");
-    std::fs::create_dir_all(&db_path).ok();
-    db_path.push("netagent.db");
-    let sqlite_store =
-        SqliteStore::open(&db_path).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let db_path = resolve_database_path()?;
+    let sqlite_store = SqliteStore::open(&db_path).map_err(io::Error::other)?;
 
     let mut state = CoreState {
         agent_runtime: AgentRuntime::from_env(),
@@ -153,7 +169,29 @@ fn run() -> io::Result<()> {
         finding_counter: 0,
     };
 
-    // Restore persisted sessions from SQLite so conversation history survives restarts
+    if let Err(error) = restore_core_counters(&mut state) {
+        return Err(io::Error::other(error));
+    }
+
+    match state.sqlite_store.reconcile_interrupted_runtime() {
+        Ok(summary) => {
+            if summary.aborted_steps > 0
+                || summary.aborted_tool_calls > 0
+                || summary.errored_sessions > 0
+                || summary.waiting_permission_sessions > 0
+            {
+                let _ = writeln!(
+                    io::stderr(),
+                    "netagent-core: reconciled interrupted state: {summary:?}"
+                );
+            }
+        }
+        Err(error) => {
+            return Err(io::Error::other(error));
+        }
+    }
+
+    // Restore persisted sessions and pending permission continuations so the UI can reconnect.
     match restore_agent_sessions(&mut state) {
         Ok(count) => {
             if count > 0 {
@@ -170,6 +208,22 @@ fn run() -> io::Result<()> {
             );
         }
     }
+    if let Err(error) = restore_permission_rules(&mut state) {
+        return Err(io::Error::other(error));
+    }
+    match restore_pending_permissions(&mut state) {
+        Ok(count) => {
+            if count > 0 {
+                let _ = writeln!(
+                    io::stderr(),
+                    "netagent-core: restored {count} pending permission request(s)"
+                );
+            }
+        }
+        Err(error) => {
+            return Err(io::Error::other(error));
+        }
+    }
 
     write_message(
         &mut stdout,
@@ -177,9 +231,9 @@ fn run() -> io::Result<()> {
             jsonrpc: JSON_RPC_VERSION,
             method: "event.core.ready",
             params: json!({
-                "phase": "phase10",
+                "phase": "phase12",
                 "protocol_version": JSON_RPC_VERSION,
-                "message": "NetAgent core ready - Phase 10 session persistence."
+                "message": "NetAgent core ready - Phase 12 agent-controlled capture tool."
             }),
         },
     )?;
@@ -212,6 +266,25 @@ fn run() -> io::Result<()> {
     Ok(())
 }
 
+fn resolve_database_path() -> io::Result<PathBuf> {
+    if let Ok(configured) = std::env::var("NETAGENT_DB_PATH") {
+        let path = PathBuf::from(configured);
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        return Ok(path);
+    }
+
+    let mut path = std::env::temp_dir();
+    path.push("netagent-captures");
+    std::fs::create_dir_all(&path)?;
+    path.push("netagent.db");
+    Ok(path)
+}
+
 fn handle_request<W: Write>(
     request: RpcRequest,
     state: &mut CoreState,
@@ -232,17 +305,18 @@ fn handle_request<W: Write>(
     let result = match request.method.as_str() {
         "system.ping" => Ok(json!({
             "ok": true,
-            "phase": "phase10",
+            "phase": "phase12",
             "message": "pong"
         })),
         "core.capabilities" => Ok(json!({
             "protocol_version": JSON_RPC_VERSION,
-            "phase": "phase10",
+            "phase": "phase12",
             "methods": [
                 "system.ping",
                 "core.capabilities",
                 "system.list_interfaces",
                 "agent.ask",
+                "agent.resume",
                 "agent.abort",
                 "session.list",
                 "session.get",
@@ -267,13 +341,19 @@ fn handle_request<W: Write>(
                 "event.core.ready",
                 "session.created",
                 "message.created",
+                "message.part.created",
+                "message.part.updated",
                 "agent.step.started",
+                "agent.reasoning.started",
+                "agent.reasoning.delta",
+                "agent.reasoning.ended",
                 "agent.text.started",
                 "agent.text.delta",
                 "agent.text.ended",
                 "agent.tool.called",
                 "agent.tool.progress",
                 "agent.tool.success",
+                "agent.tool.failed",
                 "agent.step.ended",
                 "permission.asked",
                 "permission.replied",
@@ -285,9 +365,18 @@ fn handle_request<W: Write>(
                 "report.generated"
             ],
             "llm": state.agent_runtime.llm_status(),
+            "agent_tools": state.tool_registry.agent_defs(),
+            "persistence": {
+                "enabled": true,
+                "backend": "sqlite",
+                "session_snapshot": true,
+                "pending_permission_restore": true,
+                "agent_resume": true
+            },
             "limits": {
                 "high_frequency_packet_events": false,
-                "max_steps": 8
+                "max_steps": 8,
+                "max_capture_duration_secs": 10
             }
         })),
         "system.list_interfaces" => Ok(json!({
@@ -319,27 +408,21 @@ fn handle_request<W: Write>(
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let context_summary = build_agent_context_summary(state);
-            let capture_plan = build_agent_capture_plan(state, &input);
+            let capture_status = capture_status_snapshot(state);
+            let tool_schemas = state.tool_registry.openai_tool_schemas();
 
-            let turn = match state.agent_runtime.run_turn(AgentAskInput {
-                session_id,
-                mode: AgentMode::Observe,
-                input,
-                context_summary,
-                capture_recommendation: capture_plan
-                    .as_ref()
-                    .map(agent_capture_recommendation_text),
-            }) {
-                Ok(turn) => {
-                    // Persist the turn to SQLite
-                    if let Err(error) = persist_agent_turn(&state.sqlite_store, &turn) {
-                        let _ = writeln!(
-                            io::stderr(),
-                            "netagent-core: failed to persist agent turn: {error}"
-                        );
-                    }
-                    turn
-                }
+            let turn = match run_agent_ask_turn(
+                state,
+                AgentAskInput {
+                    session_id,
+                    mode: AgentMode::Observe,
+                    input,
+                    context_summary,
+                },
+                &tool_schemas,
+                &capture_status,
+            ) {
+                Ok(turn) => turn,
                 Err(message) => {
                     return Ok(error_response(
                         request.id,
@@ -347,34 +430,148 @@ fn handle_request<W: Write>(
                             code: -32010,
                             message,
                         },
+                    ))
+                }
+            };
+
+            if let Err(error) = persist_agent_turn(&state.sqlite_store, &turn) {
+                return Ok(error_response(
+                    request.id,
+                    RpcError {
+                        code: -32011,
+                        message: format!("failed to persist agent turn: {error}"),
+                    },
+                ));
+            }
+
+            emit_agent_turn_events(writer, &turn)?;
+            let mut result = AgentRuntime::build_agent_response(&turn);
+            if let Some(pending) = &turn.pending_permission {
+                match finalize_agent_capture_permission(
+                    state,
+                    writer,
+                    &turn.session_finished.id,
+                    pending,
+                ) {
+                    Ok(proposal) => {
+                        result["session"]["run_state"] = json!(RunState::WaitingPermission);
+                        result["run_state"] = json!(RunState::WaitingPermission);
+                        result["capture_proposal"] = proposal;
+                    }
+                    Err(error) => return Ok(error_response(request.id, error)),
+                }
+            }
+            Ok(result)
+        }
+        "agent.resume" => {
+            let session_id = match required_string_param(&request.params, "session_id") {
+                Ok(id) => id,
+                Err(error) => return Ok(error_response(request.id, error)),
+            };
+            if let Some(job) = &state.capture_job {
+                if job.session_id == session_id {
+                    return Ok(RpcResponse {
+                        jsonrpc: JSON_RPC_VERSION,
+                        id: request.id,
+                        result: Some(json!({
+                            "status": "capture_running",
+                            "session_id": session_id,
+                            "message": "The approved capture is still running; resume once the pcap artifact is ready."
+                        })),
+                        error: None,
+                    });
+                }
+            }
+            let payload = match state.sqlite_store.load_agent_resume(session_id) {
+                Ok(Some(payload)) => payload,
+                Ok(None) => {
+                    return Ok(error_response(
+                        request.id,
+                        RpcError {
+                            code: -32013,
+                            message: format!(
+                                "no pending agent continuation for session {session_id}"
+                            ),
+                        },
+                    ))
+                }
+                Err(message) => {
+                    return Ok(error_response(
+                        request.id,
+                        RpcError {
+                            code: -32011,
+                            message,
+                        },
+                    ))
+                }
+            };
+
+            let outcome_summary = build_resume_outcome_summary(&payload);
+            let capture_status = capture_status_snapshot(state);
+            let tool_schemas = state.tool_registry.openai_tool_schemas();
+            let turn = match run_agent_resume_turn(
+                state,
+                AgentResumeInput {
+                    session_id: session_id.to_string(),
+                    mode: AgentMode::Observe,
+                    context_summary: build_agent_context_summary(state),
+                    outcome: payload,
+                    outcome_summary,
+                },
+                &tool_schemas,
+                &capture_status,
+            ) {
+                Ok(turn) => turn,
+                Err(message) => {
+                    let _ = state.sqlite_store.delete_agent_resume(session_id);
+                    return Ok(error_response(
+                        request.id,
+                        RpcError {
+                            code: -32010,
+                            message: format!("failed to resume agent turn: {message}"),
+                        },
                     ));
                 }
             };
 
-            emit_agent_turn_events(writer, &turn)?;
+            let _ = state.sqlite_store.delete_agent_resume(session_id);
+
+            if let Err(error) = persist_agent_turn(&state.sqlite_store, &turn) {
+                return Ok(error_response(
+                    request.id,
+                    RpcError {
+                        code: -32011,
+                        message: format!("failed to persist resumed agent turn: {error}"),
+                    },
+                ));
+            }
+
+            if let Err(error) = emit_resumed_turn_events(writer, &turn) {
+                return Ok(error_response(
+                    request.id,
+                    RpcError {
+                        code: -32001,
+                        message: format!("failed to emit resumed turn events: {error}"),
+                    },
+                ));
+            }
             let mut result = AgentRuntime::build_agent_response(&turn);
-            if let Some(plan) = capture_plan {
-                let proposal = match request_capture_permission(
-                    state,
-                    writer,
-                    &turn.session_finished.id,
-                    &plan.interface,
-                    &plan.filter,
-                    plan.duration_secs,
-                    &plan.reason,
-                    &turn.assistant_message.id,
-                ) {
-                    Ok(proposal) => proposal,
+            if let Some(pending) = &turn.pending_permission {
+                match finalize_agent_capture_permission(state, writer, session_id, pending) {
+                    Ok(proposal) => {
+                        result["session"]["run_state"] = json!(RunState::WaitingPermission);
+                        result["run_state"] = json!(RunState::WaitingPermission);
+                        result["capture_proposal"] = proposal;
+                    }
                     Err(error) => return Ok(error_response(request.id, error)),
-                };
-                result["capture_proposal"] = proposal;
+                }
             }
             Ok(result)
         }
         "agent.abort" => Ok(json!({
             "aborted": false,
             "run_state": RunState::Idle,
-            "message": "No long-running agent step is active in Phase 10."
+            "message": "No long-running agent step is active."
         })),
         "session.list" => handle_session_list(state),
         "session.get" => handle_session_get(state, &request.params),
@@ -452,11 +649,6 @@ fn emit_agent_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::Res
     )?;
     emit_event(
         writer,
-        "message.created",
-        json!({ "message": turn.assistant_message }),
-    )?;
-    emit_event(
-        writer,
         "agent.step.started",
         json!({
             "step": {
@@ -469,45 +661,444 @@ fn emit_agent_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::Res
     )?;
     emit_event(
         writer,
-        "agent.text.started",
+        "message.created",
+        json!({ "message": turn.plan_message }),
+    )?;
+    emit_event(
+        writer,
+        "agent.reasoning.started",
         json!({
             "session_id": turn.session_started.id,
-            "message_id": turn.assistant_message.id,
-            "part_id": turn.assistant_message.parts[0].id,
+            "message_id": turn.plan_message.id,
+            "part_id": turn.plan_message.parts[0].id,
+            "run_state": RunState::Analyzing,
         }),
     )?;
     emit_event(
         writer,
-        "agent.text.delta",
+        "agent.reasoning.delta",
         json!({
             "session_id": turn.session_started.id,
-            "message_id": turn.assistant_message.id,
-            "part_id": turn.assistant_message.parts[0].id,
-            "delta": turn.assistant_message.parts[0].content,
+            "message_id": turn.plan_message.id,
+            "part_id": turn.plan_message.parts[0].id,
+            "summary": turn.goal_analysis,
+            "run_state": RunState::Analyzing,
         }),
     )?;
     emit_event(
         writer,
-        "agent.text.ended",
+        "agent.reasoning.ended",
         json!({
             "session_id": turn.session_started.id,
-            "message_id": turn.assistant_message.id,
-            "part_id": turn.assistant_message.parts[0].id,
+            "message_id": turn.plan_message.id,
+            "part_id": turn.plan_message.parts[0].id,
+            "goal_analysis": turn.goal_analysis,
+            "run_state": RunState::Analyzing,
         }),
     )?;
+
+    for activity in &turn.tool_activities {
+        emit_activity_call_events(writer, turn, activity)?;
+        emit_tool_domain_events(writer, activity)?;
+    }
+
+    if let Some(pending) = &turn.pending_permission {
+        emit_event(
+            writer,
+            "message.created",
+            json!({ "message": pending.call_message }),
+        )?;
+        emit_event(
+            writer,
+            "message.part.created",
+            json!({
+                "session_id": turn.session_started.id,
+                "message_id": pending.call_message.id,
+                "part": pending.call_part,
+                "run_state": RunState::WaitingPermission,
+            }),
+        )?;
+        emit_event(
+            writer,
+            "agent.tool.called",
+            json!({
+                "tool_call": pending.tool_call,
+                "message_id": pending.call_message.id,
+                "part_id": pending.call_part.id,
+                "run_state": RunState::WaitingPermission,
+            }),
+        )?;
+    } else {
+        emit_event(
+            writer,
+            "message.created",
+            json!({ "message": turn.assistant_message }),
+        )?;
+        emit_event(
+            writer,
+            "agent.text.started",
+            json!({
+                "session_id": turn.session_started.id,
+                "message_id": turn.assistant_message.id,
+                "part_id": turn.assistant_message.parts[0].id,
+            }),
+        )?;
+        emit_event(
+            writer,
+            "agent.text.delta",
+            json!({
+                "session_id": turn.session_started.id,
+                "message_id": turn.assistant_message.id,
+                "part_id": turn.assistant_message.parts[0].id,
+                "delta": turn.assistant_message.parts[0].content,
+            }),
+        )?;
+        emit_event(
+            writer,
+            "agent.text.ended",
+            json!({
+                "session_id": turn.session_started.id,
+                "message_id": turn.assistant_message.id,
+                "part_id": turn.assistant_message.parts[0].id,
+            }),
+        )?;
+    }
     emit_event(
         writer,
         "agent.step.ended",
         json!({
             "step": turn.step,
             "run_state": turn.final_run_state,
-            "phase": "phase10",
+            "phase": "phase12",
             "llm": {
                 "used": turn.llm_used,
                 "model": turn.llm_model,
             }
         }),
     )
+}
+
+/// Emit the full lifecycle events for one completed tool activity.
+fn emit_activity_call_events<W: Write>(
+    writer: &mut W,
+    turn: &AgentTurn,
+    activity: &AgentToolActivity,
+) -> io::Result<()> {
+    let mut pending_call = activity.tool_call.clone();
+    pending_call.status = ToolCallStatus::Pending;
+    emit_event(
+        writer,
+        "message.created",
+        json!({ "message": activity.call_message }),
+    )?;
+    emit_event(
+        writer,
+        "message.part.created",
+        json!({
+            "session_id": turn.session_started.id,
+            "message_id": activity.call_message.id,
+            "part": activity.call_message.parts[0],
+            "run_state": RunState::RunningTool,
+        }),
+    )?;
+    emit_event(
+        writer,
+        "agent.tool.called",
+        json!({
+            "tool_call": pending_call,
+            "message_id": activity.call_message.id,
+            "part_id": activity.call_message.parts[0].id,
+            "run_state": RunState::RunningTool,
+        }),
+    )?;
+    emit_event(
+        writer,
+        "agent.tool.progress",
+        json!({
+            "tool_call_id": activity.tool_call.id,
+            "status": "running",
+            "message": "Validated typed input and executed through Tool Runtime.",
+            "run_state": RunState::RunningTool,
+        }),
+    )?;
+
+    let (method, run_state) = if activity.tool_call.status == ToolCallStatus::Completed {
+        ("agent.tool.success", RunState::Analyzing)
+    } else {
+        ("agent.tool.failed", RunState::Analyzing)
+    };
+    emit_event(
+        writer,
+        method,
+        json!({
+            "tool_call": activity.tool_call,
+            "summary": activity.result.summary,
+            "structured": activity.result.structured,
+            "artifacts": activity.result.artifacts,
+            "truncated": activity.result.truncated,
+            "run_state": run_state,
+        }),
+    )?;
+    emit_event(
+        writer,
+        "message.created",
+        json!({ "message": activity.result_message }),
+    )?;
+    emit_event(
+        writer,
+        "message.part.created",
+        json!({
+            "session_id": turn.session_started.id,
+            "message_id": activity.result_message.id,
+            "part": activity.result_message.parts[0],
+            "run_state": RunState::Analyzing,
+        }),
+    )?;
+    emit_event(
+        writer,
+        "message.part.updated",
+        json!({
+            "session_id": turn.session_started.id,
+            "message_id": activity.call_message.id,
+            "part": activity.call_message.parts[0],
+            "tool_call_status": activity.tool_call.status,
+            "run_state": RunState::Analyzing,
+        }),
+    )
+}
+
+/// Emit the events for a resumed turn: the injected permission outcome, the
+/// resolved capture call, any new tool calls the revised plan executed, and
+/// the final answer (unless the loop paused on a new permission again).
+fn emit_resumed_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::Result<()> {
+    emit_event(
+        writer,
+        "message.created",
+        json!({ "message": turn.user_message }),
+    )?;
+    emit_event(
+        writer,
+        "message.created",
+        json!({ "message": turn.plan_message }),
+    )?;
+    emit_event(
+        writer,
+        "agent.reasoning.started",
+        json!({
+            "session_id": turn.session_started.id,
+            "message_id": turn.plan_message.id,
+            "part_id": turn.plan_message.parts[0].id,
+            "run_state": RunState::Analyzing,
+        }),
+    )?;
+    emit_event(
+        writer,
+        "agent.reasoning.delta",
+        json!({
+            "session_id": turn.session_started.id,
+            "message_id": turn.plan_message.id,
+            "part_id": turn.plan_message.parts[0].id,
+            "summary": turn.goal_analysis,
+            "run_state": RunState::Analyzing,
+        }),
+    )?;
+    emit_event(
+        writer,
+        "agent.reasoning.ended",
+        json!({
+            "session_id": turn.session_started.id,
+            "message_id": turn.plan_message.id,
+            "part_id": turn.plan_message.parts[0].id,
+            "goal_analysis": turn.goal_analysis,
+            "run_state": RunState::Analyzing,
+        }),
+    )?;
+
+    for (index, activity) in turn.tool_activities.iter().enumerate() {
+        if index == 0 && activity.tool_call.tool_name == "capture.start" {
+            let (method, run_state) = if activity.tool_call.status == ToolCallStatus::Completed {
+                ("agent.tool.success", RunState::Analyzing)
+            } else {
+                ("agent.tool.failed", RunState::Analyzing)
+            };
+            emit_event(
+                writer,
+                method,
+                json!({
+                    "tool_call": activity.tool_call,
+                    "summary": activity.result.summary,
+                    "structured": activity.result.structured,
+                    "artifacts": activity.result.artifacts,
+                    "truncated": activity.result.truncated,
+                    "run_state": run_state,
+                }),
+            )?;
+            emit_event(
+                writer,
+                "message.created",
+                json!({ "message": activity.result_message }),
+            )?;
+            emit_event(
+                writer,
+                "message.part.created",
+                json!({
+                    "session_id": turn.session_started.id,
+                    "message_id": activity.result_message.id,
+                    "part": activity.result_message.parts[0],
+                    "run_state": RunState::Analyzing,
+                }),
+            )?;
+        } else {
+            emit_activity_call_events(writer, turn, activity)?;
+            emit_tool_domain_events(writer, activity)?;
+        }
+    }
+
+    if let Some(pending) = &turn.pending_permission {
+        emit_event(
+            writer,
+            "message.created",
+            json!({ "message": pending.call_message }),
+        )?;
+        emit_event(
+            writer,
+            "message.part.created",
+            json!({
+                "session_id": turn.session_started.id,
+                "message_id": pending.call_message.id,
+                "part": pending.call_part,
+                "run_state": RunState::WaitingPermission,
+            }),
+        )?;
+        emit_event(
+            writer,
+            "agent.tool.called",
+            json!({
+                "tool_call": pending.tool_call,
+                "message_id": pending.call_message.id,
+                "part_id": pending.call_part.id,
+                "run_state": RunState::WaitingPermission,
+            }),
+        )?;
+    } else {
+        emit_event(
+            writer,
+            "message.created",
+            json!({ "message": turn.assistant_message }),
+        )?;
+        emit_event(
+            writer,
+            "agent.text.started",
+            json!({
+                "session_id": turn.session_started.id,
+                "message_id": turn.assistant_message.id,
+                "part_id": turn.assistant_message.parts[0].id,
+            }),
+        )?;
+        emit_event(
+            writer,
+            "agent.text.delta",
+            json!({
+                "session_id": turn.session_started.id,
+                "message_id": turn.assistant_message.id,
+                "part_id": turn.assistant_message.parts[0].id,
+                "delta": turn.assistant_message.parts[0].content,
+            }),
+        )?;
+        emit_event(
+            writer,
+            "agent.text.ended",
+            json!({
+                "session_id": turn.session_started.id,
+                "message_id": turn.assistant_message.id,
+                "part_id": turn.assistant_message.parts[0].id,
+            }),
+        )?;
+    }
+    emit_event(
+        writer,
+        "agent.step.ended",
+        json!({
+            "step": turn.step,
+            "run_state": turn.final_run_state,
+            "phase": "phase12",
+            "llm": {
+                "used": turn.llm_used,
+                "model": turn.llm_model,
+            }
+        }),
+    )
+}
+
+/// Emit bounded domain events for offline analysis tool results so the UI
+/// alerts, pcap and report streams stay live. Only summaries and ArtifactRef
+/// values are forwarded; raw packet or command output is never emitted.
+fn emit_tool_domain_events<W: Write>(
+    writer: &mut W,
+    activity: &AgentToolActivity,
+) -> io::Result<()> {
+    let structured = &activity.result.structured;
+    match activity.tool_call.tool_name.as_str() {
+        "pcap.open" => {
+            if let Some(artifact) = structured.get("artifact") {
+                emit_event(writer, "pcap.created", json!({ "artifact": artifact }))?;
+                emit_event(writer, "artifact.created", json!({ "artifact": artifact }))?;
+            }
+        }
+        "tshark.extract_flows" => {
+            emit_event(
+                writer,
+                "flow.created",
+                json!({ "count": structured.get("flows_parsed") }),
+            )?;
+        }
+        "tshark.extract_dns" => {
+            emit_event(
+                writer,
+                "dns.observed",
+                json!({ "count": structured.get("dns_parsed") }),
+            )?;
+        }
+        "dns.detect_anomalies" => {
+            if let Some(findings) = structured.get("findings").and_then(Value::as_array) {
+                for finding in findings.iter().take(10) {
+                    emit_event(
+                        writer,
+                        "finding.created",
+                        json!({
+                            "finding": {
+                                "id": finding.get("id"),
+                                "severity": finding.get("severity"),
+                                "title": finding.get("title"),
+                                "summary": finding.get("description"),
+                                "evidence": finding.get("evidence"),
+                            }
+                        }),
+                    )?;
+                }
+            }
+        }
+        "report.generate" => {
+            if let Some(artifact) = structured.get("artifact") {
+                emit_event(writer, "artifact.created", json!({ "artifact": artifact }))?;
+                emit_event(
+                    writer,
+                    "report.generated",
+                    json!({
+                        "artifact": artifact,
+                        "metadata": structured.get("metadata"),
+                    }),
+                )?;
+            }
+        }
+        "ioc.export" => {
+            if let Some(artifact) = structured.get("artifact") {
+                emit_event(writer, "artifact.created", json!({ "artifact": artifact }))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn handle_tool_mock_large_output<W: Write>(
@@ -527,38 +1118,91 @@ fn handle_tool_mock_large_output<W: Write>(
         .get("message_id")
         .and_then(Value::as_str)
         .unwrap_or("msg_tool_0001");
+    let step_id = params
+        .get("step_id")
+        .and_then(Value::as_str)
+        .unwrap_or("step_tool_0001");
     let call_id = next_counter_id("call", &mut state.tool_counter);
+    let mut tool_call = ToolCall {
+        id: call_id.clone(),
+        session_id: session_id.to_string(),
+        step_id: step_id.to_string(),
+        tool_name: String::from("mock.large_output"),
+        input: json!({ "query": query }).to_string(),
+        status: ToolCallStatus::Pending,
+    };
+    state
+        .sqlite_store
+        .insert_tool_call(&tool_call)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
 
     let context = ToolContext {
         session_id: session_id.to_string(),
         message_id: message_id.to_string(),
+        part_id: params
+            .get("part_id")
+            .and_then(Value::as_str)
+            .unwrap_or("part_tool_0001")
+            .to_string(),
         call_id: call_id.clone(),
         agent: AgentMode::Observe,
+        permission: ToolPermissionContext {
+            required: false,
+            decision: String::from("not_required"),
+        },
         abort: false,
     };
-    let (tool_result, progress) =
-        state
-            .tool_registry
-            .run_mock_large_output(&context, query, &mut state.artifact_store);
-
     emit_event(
         writer,
         "agent.tool.called",
-        json!({
-            "tool_call": {
-                "id": call_id,
-                "session_id": session_id,
-                "step_id": "step_tool_0001",
-                "tool_name": "mock.large_output",
-                "input": query,
-                "status": ToolCallStatus::Pending,
-            }
-        }),
+        json!({ "tool_call": tool_call }),
     )
     .map_err(|error| RpcError {
         code: -32001,
         message: format!("failed to emit tool.called: {error}"),
     })?;
+
+    tool_call.status = ToolCallStatus::Running;
+    state
+        .sqlite_store
+        .insert_tool_call(&tool_call)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
+    let (tool_result, progress) =
+        match state
+            .tool_registry
+            .run_mock_large_output(&context, query, &mut state.artifact_store)
+        {
+            Ok(result) => result,
+            Err(message) => {
+                let _ = state
+                    .sqlite_store
+                    .update_tool_call_status(&call_id, ToolCallStatus::Error);
+                let _ = emit_event(
+                    writer,
+                    "agent.tool.failed",
+                    json!({
+                        "tool_call": {
+                            "id": call_id,
+                            "session_id": session_id,
+                            "step_id": step_id,
+                            "tool_name": "mock.large_output",
+                            "status": ToolCallStatus::Error,
+                        },
+                        "message": message,
+                    }),
+                );
+                return Err(RpcError {
+                    code: -32001,
+                    message,
+                });
+            }
+        };
 
     for update in progress {
         emit_event(
@@ -587,6 +1231,28 @@ fn handle_tool_mock_large_output<W: Write>(
             message: format!("failed to emit artifact.created: {error}"),
         })?;
     }
+
+    tool_call.status = ToolCallStatus::Completed;
+    state
+        .sqlite_store
+        .insert_tool_call(&tool_call)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
+    emit_event(
+        writer,
+        "agent.tool.success",
+        json!({
+            "tool_call": tool_call,
+            "summary": tool_result.summary,
+            "artifacts": tool_result.artifacts,
+        }),
+    )
+    .map_err(|error| RpcError {
+        code: -32001,
+        message: format!("failed to emit tool.success: {error}"),
+    })?;
 
     Ok(json!({ "tool_result": tool_result }))
 }
@@ -628,50 +1294,307 @@ fn build_agent_context_summary(state: &CoreState) -> String {
     )
 }
 
-fn build_agent_capture_plan(state: &CoreState, input: &str) -> Option<AgentCapturePlan> {
-    if state.capture_job.is_some() || state.pending_capture.is_some() {
-        return None;
-    }
+/// Run one Agent turn (a fresh `agent.ask` or a permission-driven `agent.resume`)
+/// with the Phase 12 typed tool executor. The artifact store and counters are
+/// taken out of `state` for the duration of the loop and written back after.
+fn run_agent_turn_with<F>(
+    state: &mut CoreState,
+    tool_schemas: &[Value],
+    capture_status: &Value,
+    run: F,
+) -> Result<AgentTurn, String>
+where
+    F: FnOnce(
+        &mut AgentRuntime,
+        &[Value],
+        &mut dyn FnMut(&AgentToolExecutionRequest) -> Result<ToolOutcome, String>,
+    ) -> Result<AgentTurn, String>,
+{
+    let mut artifact_store = std::mem::take(&mut state.artifact_store);
+    let tool_registry = &state.tool_registry;
+    let sqlite_store = &state.sqlite_store;
+    let mut finding_counter = state.finding_counter;
+    let mut tool_id_counter = state.tool_counter;
+    let mut permission_seq = 0_u64;
+    let permission_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
 
-    let lower = input.to_lowercase();
-    if lower.contains("stop capture")
-        || lower.contains("停止抓包")
-        || lower.contains("不要抓包")
-        || lower.contains("不用抓包")
-    {
-        return None;
-    }
+    let mut executor = |execution: &AgentToolExecutionRequest| {
+        run_agent_tool(
+            tool_registry,
+            sqlite_store,
+            &mut artifact_store,
+            capture_status,
+            &mut finding_counter,
+            &mut tool_id_counter,
+            &mut permission_seq,
+            permission_seed,
+            execution,
+        )
+    };
 
-    let wants_live_evidence = lower.contains("抓包")
-        || lower.contains("capture")
-        || lower.contains("packet")
-        || lower.contains("live")
-        || lower.contains("实时")
-        || lower.contains("当前网络")
-        || lower.contains("现在网络")
-        || lower.contains("流量")
-        || lower.contains("可疑")
-        || lower.contains("异常");
+    let turn = run(&mut state.agent_runtime, tool_schemas, &mut executor)?;
+    state.artifact_store = artifact_store;
+    state.finding_counter = finding_counter;
+    state.tool_counter = tool_id_counter;
+    Ok(turn)
+}
 
-    if !wants_live_evidence {
-        return None;
-    }
-
-    Some(AgentCapturePlan {
-        interface: String::from("mock1"),
-        filter: String::from("tcp or dns"),
-        duration_secs: 10,
-        reason: String::from(
-            "The request needs fresh live network evidence. NetAgent proposes a short bounded capture before making stronger claims.",
-        ),
+fn run_agent_ask_turn(
+    state: &mut CoreState,
+    input: AgentAskInput,
+    tool_schemas: &[Value],
+    capture_status: &Value,
+) -> Result<AgentTurn, String> {
+    run_agent_turn_with(state, tool_schemas, capture_status, |runtime, tools, executor| {
+        runtime.run_turn_with_tools(input, tools, executor)
     })
 }
 
-fn agent_capture_recommendation_text(plan: &AgentCapturePlan) -> String {
-    format!(
-        "I recommend requesting user approval for a bounded live capture: interface={}, filter={}, duration={}s. Reason: {}",
-        plan.interface, plan.filter, plan.duration_secs, plan.reason
-    )
+fn run_agent_resume_turn(
+    state: &mut CoreState,
+    input: AgentResumeInput,
+    tool_schemas: &[Value],
+    capture_status: &Value,
+) -> Result<AgentTurn, String> {
+    run_agent_turn_with(state, tool_schemas, capture_status, |runtime, tools, executor| {
+        runtime.continue_turn_with_tools(input, tools, executor)
+    })
+}
+
+fn run_agent_tool(
+    tool_registry: &ToolRegistry,
+    sqlite_store: &SqliteStore,
+    artifact_store: &mut ArtifactStore,
+    capture_status: &Value,
+    finding_counter: &mut u64,
+    tool_id_counter: &mut u64,
+    permission_seq: &mut u64,
+    permission_seed: u128,
+    execution: &AgentToolExecutionRequest,
+) -> Result<ToolOutcome, String> {
+    let context = ToolContext {
+        session_id: execution.session_id.clone(),
+        message_id: execution.message_id.clone(),
+        part_id: execution.part_id.clone(),
+        call_id: execution.call_id.clone(),
+        agent: execution.agent,
+        permission: ToolPermissionContext {
+            required: false,
+            decision: String::from("not_required"),
+        },
+        abort: false,
+    };
+    match execution.tool_name.as_str() {
+        "capture.start" => {
+            let plan = tool_registry.validate_capture_input(&execution.input)?;
+            *permission_seq += 1;
+            let request_id = format!("per_agent_{permission_seed}_{permission_seq}");
+            Ok(ToolOutcome::PermissionPending {
+                request_id,
+                summary: plan.reason.clone(),
+                plan: json!({
+                    "interface": plan.interface,
+                    "filter": plan.filter,
+                    "duration": plan.duration,
+                    "reason": plan.reason,
+                }),
+            })
+        }
+        "pcap.open"
+        | "tshark.extract_flows"
+        | "tshark.extract_dns"
+        | "dns.detect_anomalies"
+        | "report.generate"
+        | "ioc.export" => tool_registry
+            .run_offline_tool(
+                &context,
+                &execution.tool_name,
+                &execution.input,
+                sqlite_store,
+                artifact_store,
+                finding_counter,
+                tool_id_counter,
+            )
+            .map(ToolOutcome::Completed),
+        _ => tool_registry
+            .run_readonly_tool(
+                &context,
+                &execution.tool_name,
+                &execution.input,
+                sqlite_store,
+                artifact_store,
+                capture_status,
+            )
+            .map(ToolOutcome::Completed),
+    }
+}
+
+/// Turn a pending `capture.start` tool call into a real permission request.
+/// The tool call already paused the Agent loop; this persists the request and
+/// either shows the approval modal (pending) or starts the capture (always-rule).
+fn finalize_agent_capture_permission<W: Write>(
+    state: &mut CoreState,
+    writer: &mut W,
+    session_id: &str,
+    pending: &AgentPendingPermission,
+) -> Result<Value, RpcError> {
+    let plan = &pending.plan;
+    let interface = plan
+        .get("interface")
+        .and_then(Value::as_str)
+        .unwrap_or("mock1")
+        .to_string();
+    let filter = plan
+        .get("filter")
+        .and_then(Value::as_str)
+        .unwrap_or("tcp or dns")
+        .to_string();
+    let duration = plan
+        .get("duration")
+        .and_then(Value::as_u64)
+        .unwrap_or(10)
+        .clamp(1, 10);
+
+    state
+        .sqlite_store
+        .insert_tool_call(&pending.tool_call)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
+
+    let request = PermissionRequest {
+        id: pending.request_id.clone(),
+        session_id: session_id.to_string(),
+        permission: PermissionKind::CaptureLive,
+        patterns: vec![interface.clone(), filter.clone()],
+        always: vec![
+            format!("capture_live:{interface}:*"),
+            format!("capture_live:{filter}"),
+        ],
+        risk: RiskLevel::Medium,
+        metadata: PermissionMetadata {
+            tool: String::from("capture.start"),
+            command_preview: format!(
+                "tcpdump -i {interface} -nn -s 0 -w capture-{interface}.pcap {filter}"
+            ),
+            reason: pending.summary.clone(),
+        },
+        tool: ToolRef {
+            message_id: pending.call_message.id.clone(),
+            call_id: pending.tool_call.id.clone(),
+        },
+    };
+
+    let _ = emit_event(
+        writer,
+        "agent.tool.progress",
+        json!({
+            "tool_call_id": pending.tool_call.id,
+            "status": "waiting_permission",
+            "message": pending.summary,
+        }),
+    );
+
+    match state.permission_manager.ask(request.clone()) {
+        PermissionDecision::Pending => {
+            let pending_capture = PendingCapture {
+                request_id: request.id.clone(),
+                session_id: session_id.to_string(),
+                tool_call_id: pending.tool_call.id.clone(),
+                interface: interface.clone(),
+                filter: filter.clone(),
+                duration_secs: duration,
+            };
+            let continuation =
+                serde_json::to_value(&pending_capture).map_err(|error| RpcError {
+                    code: -32011,
+                    message: format!("failed to encode pending capture: {error}"),
+                })?;
+            if let Err(message) =
+                state
+                    .sqlite_store
+                    .save_pending_permission(&request, &continuation)
+            {
+                state.permission_manager.remove_pending(&request.id);
+                let _ = state
+                    .sqlite_store
+                    .update_tool_call_status(&pending.tool_call.id, ToolCallStatus::Error);
+                return Err(RpcError {
+                    code: -32011,
+                    message,
+                });
+            }
+            state.pending_capture = Some(pending_capture);
+            set_session_run_state(state, session_id, RunState::WaitingPermission)?;
+            let _ = emit_event(writer, "permission.asked", json!({ "request": request }));
+            Ok(json!({
+                "status": "waiting_permission",
+                "request_id": request.id,
+                "capture": plan,
+            }))
+        }
+        PermissionDecision::AllowedAlways => start_capture_job(
+            state,
+            writer,
+            CaptureStartInput {
+                session_id,
+                interface: &interface,
+                filter: &filter,
+                duration_secs: duration,
+                approval_status: "approved_always",
+                tool_call_id: &pending.tool_call.id,
+                request_id: &request.id,
+            },
+        ),
+        _ => Err(RpcError {
+            code: -32000,
+            message: String::from("Unexpected permission state for capture.start"),
+        }),
+    }
+}
+
+fn build_resume_outcome_summary(payload: &Value) -> String {
+    let status = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("rejected");
+    match status {
+        "approved" | "completed" => {
+            let artifact_id = payload
+                .pointer("/artifact/id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let pcap = payload
+                .pointer("/capture/pcap_path")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            format!(
+                "Live capture was approved and completed. PCAP artifact {artifact_id} is at {pcap}. Raw packets were not returned; use offline tools on that pcap."
+            )
+        }
+        "rejected" => {
+            let feedback = payload
+                .get("feedback")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if feedback.is_empty() {
+                String::from("Live capture was rejected by the user. Revise the plan or use offline analysis.")
+            } else {
+                format!("Live capture was rejected by the user. Feedback: {feedback}")
+            }
+        }
+        _ => {
+            let message = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            format!("The capture could not start: {message}. Fall back to offline analysis.")
+        }
+    }
 }
 
 /// Load all persisted sessions (with their messages) from SQLite and restore them
@@ -698,13 +1621,80 @@ fn restore_agent_sessions(state: &mut CoreState) -> Result<usize, String> {
     Ok(count)
 }
 
+fn restore_core_counters(state: &mut CoreState) -> Result<(), String> {
+    let counters = state.sqlite_store.persistent_counters()?;
+    state.permission_counter = counters.permission;
+    state.capture_counter = counters.capture_or_call;
+    state.tool_counter = counters.tool_data;
+    state.finding_counter = counters.finding;
+    Ok(())
+}
+
+fn restore_pending_permissions(state: &mut CoreState) -> Result<usize, String> {
+    let pending = state.sqlite_store.list_pending_permissions()?;
+    let count = pending.len();
+
+    for stored in pending {
+        state.permission_counter = state
+            .permission_counter
+            .max(id_suffix(&stored.request.id).unwrap_or(0));
+        state.capture_counter = state
+            .capture_counter
+            .max(id_suffix(&stored.request.tool.call_id).unwrap_or(0));
+        state
+            .permission_manager
+            .restore_pending(stored.request.clone());
+
+        if state.pending_capture.is_none() {
+            let capture = serde_json::from_value::<PendingCapture>(stored.continuation)
+                .map_err(|error| format!("failed to restore permission continuation: {error}"))?;
+            state.pending_capture = Some(capture);
+        }
+    }
+
+    Ok(count)
+}
+
+fn restore_permission_rules(state: &mut CoreState) -> Result<(), String> {
+    let rules = state.sqlite_store.list_permission_rules()?;
+    state.permission_manager.persist_always_rule(&rules);
+    Ok(())
+}
+
+fn id_suffix(id: &str) -> Option<u64> {
+    id.rsplit('_').next()?.parse::<u64>().ok()
+}
+
+fn set_session_run_state(
+    state: &mut CoreState,
+    session_id: &str,
+    run_state: RunState,
+) -> Result<(), RpcError> {
+    state
+        .sqlite_store
+        .update_session_run_state(session_id, run_state)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
+    state
+        .agent_runtime
+        .set_session_run_state(session_id, run_state);
+    Ok(())
+}
+
 /// Persist the result of a single agent turn to SQLite.
 fn persist_agent_turn(store: &SqliteStore, turn: &AgentTurn) -> Result<(), String> {
+    let tool_calls = turn
+        .tool_activities
+        .iter()
+        .map(|activity| activity.tool_call.clone())
+        .collect::<Vec<_>>();
     store.save_agent_turn(
         &turn.session_finished,
-        &turn.user_message,
-        &turn.assistant_message,
+        &turn.messages,
         &turn.step,
+        &tool_calls,
     )
 }
 
@@ -748,11 +1738,36 @@ fn handle_session_get(state: &CoreState, params: &Value) -> Result<Value, RpcErr
             code: -32011,
             message,
         })?;
+    let tool_calls = state
+        .sqlite_store
+        .load_tool_calls(session_id)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
+    let message_parts = messages
+        .iter()
+        .flat_map(|message| message.parts.iter().cloned())
+        .collect::<Vec<_>>();
+    let pending_permissions = state
+        .sqlite_store
+        .list_pending_permissions()
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?
+        .into_iter()
+        .filter(|pending| pending.request.session_id == session_id)
+        .map(|pending| pending.request)
+        .collect::<Vec<_>>();
 
     Ok(json!({
         "session": session,
         "messages": messages,
-        "steps": steps
+        "message_parts": message_parts,
+        "steps": steps,
+        "tool_calls": tool_calls,
+        "pending_permissions": pending_permissions
     }))
 }
 
@@ -794,25 +1809,40 @@ fn handle_capture_start<W: Write>(
     request_capture_permission(
         state,
         writer,
-        session_id,
-        interface,
-        filter,
-        duration,
-        &format!("Capture live packets from interface {interface}"),
-        "msg_capture_0001",
+        CapturePermissionInput {
+            session_id,
+            interface,
+            filter,
+            duration_secs: duration,
+            reason: &format!("Capture live packets from interface {interface}"),
+            message_id: "msg_capture_0001",
+            step_id: "step_capture_0001",
+        },
     )
 }
 
 fn request_capture_permission<W: Write>(
     state: &mut CoreState,
     writer: &mut W,
-    session_id: &str,
-    interface: &str,
-    filter: &str,
-    duration: u64,
-    reason: &str,
-    message_id: &str,
+    input: CapturePermissionInput<'_>,
 ) -> Result<Value, RpcError> {
+    let CapturePermissionInput {
+        session_id,
+        interface,
+        filter,
+        duration_secs: duration,
+        reason,
+        message_id,
+        step_id,
+    } = input;
+    if state.pending_capture.is_some() {
+        return Err(RpcError {
+            code: -32003,
+            message: String::from("A capture permission request is already pending."),
+        });
+    }
+
+    let call_id = next_counter_id("call", &mut state.capture_counter);
     let request = PermissionRequest {
         id: next_counter_id("per", &mut state.permission_counter),
         session_id: session_id.to_string(),
@@ -832,19 +1862,65 @@ fn request_capture_permission<W: Write>(
         },
         tool: ToolRef {
             message_id: message_id.to_string(),
-            call_id: next_counter_id("call", &mut state.capture_counter),
+            call_id: call_id.clone(),
         },
     };
+    let tool_call = ToolCall {
+        id: call_id.clone(),
+        session_id: session_id.to_string(),
+        step_id: step_id.to_string(),
+        tool_name: String::from("capture.start"),
+        input: json!({
+            "interface": interface,
+            "filter": filter,
+            "duration": duration,
+        })
+        .to_string(),
+        status: ToolCallStatus::Pending,
+    };
+    state
+        .sqlite_store
+        .insert_tool_call(&tool_call)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
 
     match state.permission_manager.ask(request.clone()) {
         PermissionDecision::Pending => {
-            state.pending_capture = Some(PendingCapture {
+            let pending_capture = PendingCapture {
                 request_id: request.id.clone(),
                 session_id: session_id.to_string(),
+                tool_call_id: call_id,
                 interface: interface.to_string(),
                 filter: filter.to_string(),
                 duration_secs: duration,
-            });
+            };
+            let continuation =
+                serde_json::to_value(&pending_capture).map_err(|error| RpcError {
+                    code: -32011,
+                    message: format!("failed to encode pending capture: {error}"),
+                })?;
+            if let Err(message) = state
+                .sqlite_store
+                .save_pending_permission(&request, &continuation)
+            {
+                state.permission_manager.remove_pending(&request.id);
+                let _ = state
+                    .sqlite_store
+                    .update_tool_call_status(&request.tool.call_id, ToolCallStatus::Error);
+                return Err(RpcError {
+                    code: -32011,
+                    message,
+                });
+            }
+            state.pending_capture = Some(pending_capture);
+            set_session_run_state(state, session_id, RunState::WaitingPermission)?;
+            let _ = emit_event(
+                writer,
+                "agent.tool.called",
+                json!({ "tool_call": tool_call }),
+            );
             let _ = emit_event(writer, "permission.asked", json!({ "request": request }));
             Ok(json!({
                 "status": "waiting_permission",
@@ -859,11 +1935,15 @@ fn request_capture_permission<W: Write>(
         PermissionDecision::AllowedAlways => start_capture_job(
             state,
             writer,
-            session_id,
-            interface,
-            filter,
-            duration,
-            "approved_always",
+            CaptureStartInput {
+                session_id,
+                interface,
+                filter,
+                duration_secs: duration,
+                approval_status: "approved_always",
+                tool_call_id: &request.tool.call_id,
+                request_id: &request.id,
+            },
         ),
         PermissionDecision::AllowedOnce | PermissionDecision::Rejected => Err(RpcError {
             code: -32000,
@@ -898,6 +1978,7 @@ fn handle_permission_reply<W: Write>(
         decision,
         feedback,
     };
+    let persisted_reply = reply.clone();
 
     let outcome = state
         .permission_manager
@@ -907,17 +1988,65 @@ fn handle_permission_reply<W: Write>(
             message: format!("pending request not found: {request_id}"),
         })?;
 
+    if let Err(message) = state.sqlite_store.resolve_permission(&persisted_reply) {
+        state
+            .permission_manager
+            .restore_pending(outcome.request.clone());
+        return Err(RpcError {
+            code: -32011,
+            message,
+        });
+    }
+
     let _ = emit_permission_replied(writer, &outcome);
 
-    match outcome.decision {
+    let result = match outcome.decision {
         PermissionDecision::AllowedOnce => {
             start_capture_from_pending(state, writer, &outcome.request.id, "approved_once")
         }
-        PermissionDecision::AllowedAlways => {
-            start_capture_from_pending(state, writer, &outcome.request.id, "approved_always")
-        }
+        PermissionDecision::AllowedAlways => state
+            .sqlite_store
+            .save_permission_rules(&outcome.request.always)
+            .map_err(|message| RpcError {
+                code: -32011,
+                message,
+            })
+            .and_then(|_| {
+                start_capture_from_pending(state, writer, &outcome.request.id, "approved_always")
+            }),
         PermissionDecision::Rejected => {
             state.pending_capture = None;
+            state
+                .sqlite_store
+                .update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Aborted)
+                .map_err(|message| RpcError {
+                    code: -32011,
+                    message,
+                })?;
+            set_session_run_state(state, &outcome.request.session_id, RunState::Idle)?;
+            let _ = emit_event(
+                writer,
+                "agent.tool.failed",
+                json!({
+                    "tool_call": {
+                        "id": outcome.request.tool.call_id,
+                        "session_id": outcome.request.session_id,
+                        "tool_name": outcome.request.metadata.tool,
+                        "status": ToolCallStatus::Aborted,
+                    },
+                    "message": "Tool call was not executed because permission was rejected.",
+                    "feedback": outcome.feedback,
+                }),
+            );
+            let _ = state.sqlite_store.save_agent_resume(
+                &outcome.request.session_id,
+                &json!({
+                    "status": "rejected",
+                    "request_id": outcome.request.id,
+                    "feedback": outcome.feedback,
+                    "capture": null,
+                }),
+            );
             Ok(json!({
                 "status": "rejected",
                 "request_id": outcome.request.id,
@@ -928,11 +2057,42 @@ fn handle_permission_reply<W: Write>(
             code: -32000,
             message: String::from("Unexpected pending outcome after permission.reply"),
         }),
+    };
+
+    if result.is_err()
+        && matches!(
+            outcome.decision,
+            PermissionDecision::AllowedOnce | PermissionDecision::AllowedAlways
+        )
+    {
+        let _ = state
+            .sqlite_store
+            .update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Error);
+        let _ = set_session_run_state(state, &outcome.request.session_id, RunState::Error);
+        let _ = emit_event(
+            writer,
+            "agent.tool.failed",
+            json!({
+                "tool_call": {
+                    "id": outcome.request.tool.call_id,
+                    "session_id": outcome.request.session_id,
+                    "tool_name": outcome.request.metadata.tool,
+                    "status": ToolCallStatus::Error,
+                },
+                "message": "Approved tool call failed to start."
+            }),
+        );
     }
+
+    result
 }
 
 fn handle_capture_status(state: &mut CoreState) -> Result<Value, RpcError> {
-    Ok(match &state.capture_job {
+    Ok(capture_status_snapshot(state))
+}
+
+fn capture_status_snapshot(state: &CoreState) -> Value {
+    match &state.capture_job {
         Some(job) => json!({
             "status": "running",
             "capture_id": job.id,
@@ -946,7 +2106,7 @@ fn handle_capture_status(state: &mut CoreState) -> Result<Value, RpcError> {
         None => json!({
             "status": "idle"
         }),
-    })
+    }
 }
 
 fn handle_capture_stop<W: Write>(state: &mut CoreState, writer: &mut W) -> Result<Value, RpcError> {
@@ -1011,23 +2171,32 @@ fn start_capture_from_pending<W: Write>(
     start_capture_job(
         state,
         writer,
-        &pending.session_id,
-        &pending.interface,
-        &pending.filter,
-        pending.duration_secs,
-        approval_status,
+        CaptureStartInput {
+            session_id: &pending.session_id,
+            interface: &pending.interface,
+            filter: &pending.filter,
+            duration_secs: pending.duration_secs,
+            approval_status,
+            tool_call_id: &pending.tool_call_id,
+            request_id,
+        },
     )
 }
 
 fn start_capture_job<W: Write>(
     state: &mut CoreState,
     writer: &mut W,
-    session_id: &str,
-    interface: &str,
-    filter: &str,
-    duration_secs: u64,
-    approval_status: &str,
+    input: CaptureStartInput<'_>,
 ) -> Result<Value, RpcError> {
+    let CaptureStartInput {
+        session_id,
+        interface,
+        filter,
+        duration_secs,
+        approval_status,
+        tool_call_id,
+        request_id,
+    } = input;
     if state.capture_job.is_some() {
         return Err(RpcError {
             code: -32003,
@@ -1044,10 +2213,34 @@ fn start_capture_job<W: Write>(
     })?;
 
     let pcap_path = capture_dir.join(format!("{capture_id}.pcap"));
-    let child = spawn_tcpdump(interface, filter, &pcap_path).map_err(|error| RpcError {
-        code: -32005,
-        message: error,
-    })?;
+    state
+        .sqlite_store
+        .update_tool_call_status(tool_call_id, ToolCallStatus::Running)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
+    let child = match spawn_tcpdump(interface, filter, &pcap_path) {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = state
+                .sqlite_store
+                .update_tool_call_status(tool_call_id, ToolCallStatus::Error);
+            let _ = state.sqlite_store.save_agent_resume(
+                session_id,
+                &json!({
+                    "status": "failed",
+                    "request_id": request_id,
+                    "message": error,
+                    "capture": null,
+                }),
+            );
+            return Err(RpcError {
+                code: -32005,
+                message: error,
+            });
+        }
+    };
 
     emit_event(
         writer,
@@ -1068,6 +2261,8 @@ fn start_capture_job<W: Write>(
     state.capture_job = Some(CaptureJob {
         id: capture_id.clone(),
         session_id: session_id.to_string(),
+        tool_call_id: tool_call_id.to_string(),
+        request_id: request_id.to_string(),
         interface: interface.to_string(),
         filter: filter.to_string(),
         duration_secs,
@@ -1075,6 +2270,21 @@ fn start_capture_job<W: Write>(
         pcap_path: pcap_path.to_string_lossy().to_string(),
         child,
     });
+    set_session_run_state(state, session_id, RunState::Capturing)?;
+
+    emit_event(
+        writer,
+        "agent.tool.progress",
+        json!({
+            "tool_call_id": tool_call_id,
+            "status": "running",
+            "message": "Bounded live capture started after permission approval."
+        }),
+    )
+    .map_err(|error| RpcError {
+        code: -32001,
+        message: format!("failed to emit capture tool progress: {error}"),
+    })?;
 
     Ok(json!({
         "status": approval_status,
@@ -1083,6 +2293,7 @@ fn start_capture_job<W: Write>(
         "filter": filter,
         "duration_secs": duration_secs,
         "pcap_path": pcap_path,
+        "tool_call_id": tool_call_id,
     }))
 }
 
@@ -1131,10 +2342,8 @@ fn reconcile_capture_state<W: Write>(state: &mut CoreState, writer: &mut W) -> i
         None => false,
     };
 
-    if should_finalize {
-        if let Some(job) = state.capture_job.take() {
-            let _ = finalize_capture_job(state, writer, job, "completed")?;
-        }
+    if should_finalize && let Some(job) = state.capture_job.take() {
+        let _ = finalize_capture_job(state, writer, job, "completed")?;
     }
 
     Ok(())
@@ -1154,6 +2363,27 @@ fn finalize_capture_job<W: Write>(
         job.id, job.interface, job.filter
     );
     let artifact = state.artifact_store.register_pcap(&job.pcap_path, &note);
+    state
+        .sqlite_store
+        .update_tool_call_status(&job.tool_call_id, ToolCallStatus::Completed)
+        .map_err(io::Error::other)?;
+    set_session_run_state(state, &job.session_id, RunState::Idle)
+        .map_err(|error| io::Error::other(error.message))?;
+    let _ = state.sqlite_store.save_agent_resume(
+        &job.session_id,
+        &json!({
+            "status": "approved",
+            "request_id": job.request_id,
+            "capture": {
+                "capture_id": job.id,
+                "interface": job.interface,
+                "filter": job.filter,
+                "duration_secs": job.duration_secs,
+                "pcap_path": job.pcap_path,
+            },
+            "artifact": artifact,
+        }),
+    );
 
     emit_event(
         writer,
@@ -1167,6 +2397,20 @@ fn finalize_capture_job<W: Write>(
     )?;
     emit_event(writer, "pcap.created", json!({ "artifact": artifact }))?;
     emit_event(writer, "artifact.created", json!({ "artifact": artifact }))?;
+    emit_event(
+        writer,
+        "agent.tool.success",
+        json!({
+            "tool_call": {
+                "id": job.tool_call_id,
+                "session_id": job.session_id,
+                "tool_name": "capture.start",
+                "status": ToolCallStatus::Completed,
+            },
+            "summary": "Bounded capture completed; PCAP was stored as an artifact.",
+            "artifact": artifact,
+        }),
+    )?;
 
     Ok(json!({
         "status": "stopped",
@@ -1515,7 +2759,11 @@ fn handle_report_generate<W: Write>(
         .and_then(Value::as_str)
         .unwrap_or("NetAgent Report");
 
-    let input = collect_report_input(&state.sqlite_store, &state.artifact_store, title)?;
+    let input = collect_report_input(&state.sqlite_store, &state.artifact_store, title)
+        .map_err(|message| RpcError {
+            code: -32009,
+            message,
+        })?;
     let (content, metadata) = build_markdown_report(&input);
     let artifact = state
         .artifact_store
@@ -1610,46 +2858,15 @@ fn handle_ioc_export<W: Write>(
     }))
 }
 
-fn list_flows_for_export(store: &SqliteStore) -> Result<Vec<Flow>, RpcError> {
-    store.list_flows().map_err(|message| RpcError {
-        code: -32007,
-        message,
-    })
-}
-
-fn list_dns_events_for_export(store: &SqliteStore) -> Result<Vec<DnsEvent>, RpcError> {
-    store.list_dns_events().map_err(|message| RpcError {
-        code: -32007,
-        message,
-    })
-}
-
-fn list_findings_for_export(store: &SqliteStore) -> Result<Vec<Finding>, RpcError> {
-    store.list_findings().map_err(|message| RpcError {
-        code: -32007,
-        message,
-    })
-}
-
-fn collect_report_input(
-    store: &SqliteStore,
-    artifact_store: &ArtifactStore,
-    title: &str,
-) -> Result<MarkdownReportInput, RpcError> {
-    Ok(MarkdownReportInput {
-        title: title.to_string(),
-        findings: list_findings_for_export(store)?,
-        flows: list_flows_for_export(store)?,
-        dns_events: list_dns_events_for_export(store)?,
-        artifacts: artifact_store.list_artifacts(),
-    })
-}
-
 fn build_ioc_export_document(
     store: &SqliteStore,
     artifact_store: &ArtifactStore,
 ) -> Result<IocExportDocument, RpcError> {
-    let input = collect_report_input(store, artifact_store, "NetAgent IOC Export")?;
+    let input = collect_report_input(store, artifact_store, "NetAgent IOC Export")
+        .map_err(|message| RpcError {
+            code: -32009,
+            message,
+        })?;
     let evidence_bundle = build_evidence_bundle_metadata(&input);
 
     Ok(IocExportDocument {
@@ -1823,7 +3040,7 @@ mod tests {
         std::fs::write(path, bytes).expect("write test pcap");
     }
 
-    fn test_core_state(db_path: &PathBuf) -> CoreState {
+    fn test_core_state(db_path: &std::path::Path) -> CoreState {
         CoreState {
             agent_runtime: AgentRuntime::disabled(),
             permission_manager: PermissionManager::default(),
@@ -2209,7 +3426,7 @@ mod tests {
             .as_str()
             .expect("session id")
             .to_string();
-        assert_eq!(first["phase"], "phase10");
+        assert_eq!(first["phase"], "phase12");
         assert_eq!(first["session_created"], true);
         assert_eq!(first["llm"]["used"], false);
         assert!(
@@ -2262,9 +3479,16 @@ mod tests {
             json!({ "session_id": session_id }),
         );
         let message_list = messages["messages"].as_array().expect("messages");
-        assert_eq!(message_list.len(), 2);
+        assert_eq!(message_list.len(), 11);
         assert_eq!(message_list[0]["role"], "user");
-        assert_eq!(message_list[1]["role"], "assistant");
+        assert_eq!(message_list.last().unwrap()["role"], "assistant");
+        assert_eq!(
+            message_list
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            4
+        );
 
         let (session, _) = call_rpc(
             &mut state,
@@ -2273,8 +3497,91 @@ mod tests {
             json!({ "session_id": session_id }),
         );
         assert_eq!(session["session"]["id"], session_id);
-        assert_eq!(session["messages"].as_array().expect("messages").len(), 2);
+        assert_eq!(session["messages"].as_array().expect("messages").len(), 11);
+        assert_eq!(session["tool_calls"].as_array().unwrap().len(), 4);
         assert_eq!(session["steps"].as_array().expect("steps").len(), 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn agent_ask_runs_and_persists_phase11_readonly_tool_loop() {
+        let db_path = temp_db_path("phase11-readonly-tool-loop");
+        let mut state = test_core_state(&db_path);
+
+        let (turn, events) = call_rpc(
+            &mut state,
+            1,
+            "agent.ask",
+            json!({ "input": "List stored flows and findings." }),
+        );
+        let tool_calls = turn["tool_calls"].as_array().expect("tool calls");
+        assert_eq!(turn["phase"], "phase12");
+        assert_eq!(turn["resumed"], false);
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0]["tool_name"], "flow.list");
+        assert_eq!(tool_calls[1]["tool_name"], "finding.list");
+        assert!(tool_calls.iter().all(|call| call["status"] == "completed"));
+        assert_eq!(
+            turn["goal_analysis"]["selected_tools"],
+            json!(["flow.list", "finding.list"])
+        );
+        assert!(
+            turn["assistant_message"]["parts"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("stored structured evidence")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["method"] == "agent.tool.called")
+                .count(),
+            2
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["method"] == "agent.reasoning.ended")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["method"] == "agent.tool.success")
+                .count(),
+            2
+        );
+
+        let session_id = turn["session"]["id"].as_str().unwrap();
+        let (snapshot, _) = call_rpc(
+            &mut state,
+            2,
+            "session.get",
+            json!({ "session_id": session_id }),
+        );
+        let parts = snapshot["message_parts"].as_array().unwrap();
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|part| part["kind"] == "tool_call")
+                .count(),
+            2
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|part| part["kind"] == "reasoning")
+                .count(),
+            1
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|part| part["kind"] == "tool_result")
+                .count(),
+            2
+        );
+        assert_eq!(snapshot["tool_calls"].as_array().unwrap().len(), 2);
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -2309,8 +3616,8 @@ mod tests {
             }),
         );
         assert_eq!(second["session_created"], false);
-        assert_eq!(second["assistant_message"]["id"], "msg_0004");
-        assert_eq!(second["assistant_message"]["parts"][0]["id"], "part_0004");
+        assert_eq!(second["assistant_message"]["id"], "msg_0014");
+        assert_eq!(second["assistant_message"]["parts"][0]["id"], "part_0014");
         assert_eq!(second["step"]["id"], "step_0002");
 
         let (messages, _) = call_rpc(
@@ -2319,9 +3626,235 @@ mod tests {
             "message.list",
             json!({ "session_id": session_id }),
         );
-        assert_eq!(messages["messages"].as_array().expect("messages").len(), 4);
+        assert_eq!(messages["messages"].as_array().expect("messages").len(), 14);
 
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn pending_permission_and_tool_call_survive_restart_and_can_be_rejected() {
+        let db_path = temp_db_path("phase10-pending-permission-restore");
+        let mut state = test_core_state(&db_path);
+
+        let (proposal, _) = call_rpc(
+            &mut state,
+            1,
+            "agent.ask",
+            json!({ "input": "请抓包看看当前网络是否有异常流量" }),
+        );
+        let session_id = proposal["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let request_id = proposal["capture_proposal"]["request_id"]
+            .as_str()
+            .expect("request id")
+            .to_string();
+        assert_eq!(proposal["run_state"], "waiting_permission");
+        drop(state);
+
+        let mut restored = test_core_state(&db_path);
+        restored
+            .sqlite_store
+            .reconcile_interrupted_runtime()
+            .expect("reconcile runtime");
+        assert_eq!(restore_agent_sessions(&mut restored).expect("sessions"), 1);
+        assert_eq!(
+            restore_pending_permissions(&mut restored).expect("pending"),
+            1
+        );
+
+        let (pending, _) = call_rpc(&mut restored, 2, "permission.list_pending", json!({}));
+        assert_eq!(pending["pending"].as_array().expect("pending").len(), 1);
+        assert_eq!(pending["pending"][0]["id"], request_id);
+
+        let (snapshot, _) = call_rpc(
+            &mut restored,
+            3,
+            "session.get",
+            json!({ "session_id": session_id }),
+        );
+        assert_eq!(snapshot["session"]["run_state"], "waiting_permission");
+        assert_eq!(snapshot["pending_permissions"].as_array().unwrap().len(), 1);
+        let stored_calls = snapshot["tool_calls"].as_array().unwrap();
+        assert_eq!(stored_calls.len(), 1);
+        assert!(
+            stored_calls.iter().any(|call| {
+                call["tool_name"] == "capture.start"
+                    && call["status"] == "waiting_permission"
+            })
+        );
+
+        let (reply, events) = call_rpc(
+            &mut restored,
+            4,
+            "permission.reply",
+            json!({
+                "request_id": request_id,
+                "decision": "reject",
+            }),
+        );
+        assert_eq!(reply["status"], "rejected");
+        assert!(
+            events
+                .iter()
+                .any(|event| event["method"] == "agent.tool.failed")
+        );
+
+        let (settled, _) = call_rpc(
+            &mut restored,
+            5,
+            "session.get",
+            json!({ "session_id": session_id }),
+        );
+        assert_eq!(settled["session"]["run_state"], "idle");
+        assert_eq!(settled["pending_permissions"].as_array().unwrap().len(), 0);
+        assert!(
+            settled["tool_calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|call| {
+                    call["tool_name"] == "capture.start" && call["status"] == "aborted"
+                })
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn interrupted_steps_tools_and_sessions_are_reconciled_on_restart() {
+        let db_path = temp_db_path("phase10-interrupted-recovery");
+        let store = SqliteStore::open(&db_path).expect("open store");
+        let session = netagent_models::Session {
+            id: String::from("ses_0042"),
+            mode: AgentMode::Observe,
+            run_state: RunState::RunningTool,
+            max_steps: 8,
+        };
+        store.save_session(&session).expect("save session");
+        store
+            .insert_step(&netagent_models::Step {
+                id: String::from("step_0042"),
+                session_id: session.id.clone(),
+                status: StepStatus::Running,
+                attempt: 1,
+            })
+            .expect("save step");
+        store
+            .insert_tool_call(&ToolCall {
+                id: String::from("call_0042"),
+                session_id: session.id.clone(),
+                step_id: String::from("step_0042"),
+                tool_name: String::from("flow.list"),
+                input: String::from("{}"),
+                status: ToolCallStatus::Running,
+            })
+            .expect("save tool call");
+
+        let summary = store
+            .reconcile_interrupted_runtime()
+            .expect("reconcile runtime");
+        assert_eq!(summary.aborted_steps, 1);
+        assert_eq!(summary.aborted_tool_calls, 1);
+        assert_eq!(summary.errored_sessions, 1);
+        assert_eq!(
+            store.load_session(&session.id).unwrap().unwrap().run_state,
+            RunState::Error
+        );
+        assert_eq!(
+            store.load_steps(&session.id).unwrap()[0].status,
+            StepStatus::Aborted
+        );
+        assert_eq!(
+            store.load_tool_calls(&session.id).unwrap()[0].status,
+            ToolCallStatus::Aborted
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn always_permission_rules_are_restored_from_sqlite() {
+        let db_path = temp_db_path("phase10-permission-rules");
+        let store = SqliteStore::open(&db_path).expect("open store");
+        store
+            .save_permission_rules(&[String::from("capture_live:mock1:*")])
+            .expect("save permission rule");
+        drop(store);
+
+        let mut restored = test_core_state(&db_path);
+        restore_permission_rules(&mut restored).expect("restore permission rules");
+        assert!(
+            restored
+                .permission_manager
+                .evaluate(PermissionKind::CaptureLive, &[String::from("mock1")],)
+        );
+
+        drop(restored);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn bounded_tool_result_and_completed_call_are_available_in_session_snapshot() {
+        let db_path = temp_db_path("phase10-tool-snapshot");
+        let mut state = test_core_state(&db_path);
+        let (turn, _) = call_rpc(
+            &mut state,
+            1,
+            "agent.ask",
+            json!({ "input": "Hello NetAgent." }),
+        );
+        let session_id = turn["session"]["id"].as_str().unwrap();
+        let message_id = turn["assistant_message"]["id"].as_str().unwrap();
+        let step_id = turn["step"]["id"].as_str().unwrap();
+
+        let (tool, events) = call_rpc(
+            &mut state,
+            2,
+            "tool.mock_large_output",
+            json!({
+                "session_id": session_id,
+                "message_id": message_id,
+                "step_id": step_id,
+                "query": "Summarize mock flows without returning raw output."
+            }),
+        );
+        assert_eq!(tool["tool_result"]["truncated"], true);
+        assert!(tool["tool_result"]["raw_output_artifact"].is_object());
+        let raw_output_path = tool["tool_result"]["raw_output_artifact"]["path"]
+            .as_str()
+            .expect("raw output artifact path")
+            .to_string();
+        assert!(std::path::Path::new(&raw_output_path).exists());
+        assert!(
+            events
+                .iter()
+                .any(|event| event["method"] == "agent.tool.success")
+        );
+
+        let (snapshot, _) = call_rpc(
+            &mut state,
+            3,
+            "session.get",
+            json!({ "session_id": session_id }),
+        );
+        assert_eq!(snapshot["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["tool_calls"][0]["tool_name"], "mock.large_output");
+        assert_eq!(snapshot["tool_calls"][0]["status"], "completed");
+        assert_eq!(snapshot["message_parts"].as_array().unwrap().len(), 3);
+
+        let raw = rusqlite::Connection::open(&db_path).expect("inspect sqlite");
+        let message_part_count: usize = raw
+            .query_row("SELECT COUNT(*) FROM message_parts", [], |row| row.get(0))
+            .expect("count message parts");
+        assert_eq!(message_part_count, 3);
+
+        drop(raw);
+        drop(state);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(raw_output_path);
     }
 
     #[test]
@@ -2336,17 +3869,266 @@ mod tests {
             json!({ "input": "请抓包看看当前网络是否有异常流量" }),
         );
 
-        assert_eq!(result["phase"], "phase10");
+        assert_eq!(result["phase"], "phase12");
+        assert_eq!(result["run_state"], "waiting_permission");
         assert_eq!(result["capture_proposal"]["status"], "waiting_permission");
         assert_eq!(result["capture_proposal"]["capture"]["duration"], 10);
-        assert!(
+        assert!(!result["permission_request_id"].as_str().unwrap().is_empty());
+        assert_eq!(
             events
                 .iter()
-                .any(|event| event["method"] == "permission.asked")
+                .filter(|event| event["method"] == "permission.asked")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["method"] == "agent.tool.called")
+                .count(),
+            1
         );
         assert_eq!(state.permission_manager.list_pending().len(), 1);
         assert!(state.capture_job.is_none());
 
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn rejected_capture_permission_resumes_with_offline_pcap_analysis() {
+        if !tshark_available() {
+            return;
+        }
+
+        let db_path = temp_db_path("phase12-resume-replan");
+        let pcap_path = temp_pcap_path("phase12-resume-replan");
+        write_test_dns_pcap(&pcap_path);
+        let pcap_path_str = pcap_path.to_str().expect("pcap path").to_string();
+        let mut state = test_core_state(&db_path);
+
+        let (proposal, _) = call_rpc(
+            &mut state,
+            1,
+            "agent.ask",
+            json!({ "input": "请实时抓包分析当前网络是否存在 DNS 异常" }),
+        );
+        assert_eq!(proposal["run_state"], "waiting_permission");
+        let session_id = proposal["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let request_id = proposal["permission_request_id"]
+            .as_str()
+            .expect("request id")
+            .to_string();
+
+        let (reply, _) = call_rpc(
+            &mut state,
+            2,
+            "permission.reply",
+            json!({
+                "request_id": request_id,
+                "decision": "reject_with_feedback",
+                "feedback": format!("不要实时抓包，请分析本地 pcap 文件 {pcap_path_str}"),
+            }),
+        );
+        assert_eq!(reply["status"], "rejected");
+
+        let (resumed, events) = call_rpc(
+            &mut state,
+            3,
+            "agent.resume",
+            json!({ "session_id": session_id }),
+        );
+        assert_eq!(resumed["resumed"], true);
+        assert_eq!(resumed["run_state"], "idle");
+        let tool_names = resumed["tool_calls"]
+            .as_array()
+            .expect("tool calls")
+            .iter()
+            .map(|call| call["tool_name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_names,
+            vec![
+                "capture.start",
+                "pcap.open",
+                "dns.detect_anomalies",
+                "report.generate",
+                "ioc.export"
+            ]
+        );
+        assert_eq!(resumed["tool_calls"][0]["status"], "aborted");
+        assert!(
+            resumed["tool_calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|call| call["tool_name"] != "capture.start"
+                    || call["status"] == "aborted")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["method"] == "agent.tool.success")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["method"] == "finding.created")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["method"] == "pcap.created")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["method"] == "report.generated")
+        );
+        assert!(
+            resumed["assistant_message"]["parts"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("离线")
+        );
+
+        let (snapshot, _) = call_rpc(
+            &mut state,
+            4,
+            "session.get",
+            json!({ "session_id": session_id }),
+        );
+        assert_eq!(snapshot["session"]["run_state"], "idle");
+        assert_eq!(snapshot["tool_calls"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            snapshot["steps"].as_array().unwrap()[0]["status"],
+            "completed"
+        );
+
+        let (findings, _) = call_rpc(&mut state, 5, "finding.list", json!({}));
+        assert_eq!(findings["total"], 1);
+        assert_eq!(
+            findings["findings"][0]["category"],
+            "dns_anomaly"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(pcap_path);
+    }
+
+    #[test]
+    fn approved_capture_permission_waits_for_completion_then_resumes() {
+        let db_path = temp_db_path("phase12-resume-approved");
+        let mut state = test_core_state(&db_path);
+
+        let (proposal, _) = call_rpc(
+            &mut state,
+            1,
+            "agent.ask",
+            json!({ "input": "请抓包分析当前网络" }),
+        );
+        assert_eq!(proposal["run_state"], "waiting_permission");
+        let session_id = proposal["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let request_id = proposal["permission_request_id"]
+            .as_str()
+            .expect("request id")
+            .to_string();
+
+        let (reply, _) = call_rpc(
+            &mut state,
+            2,
+            "permission.reply",
+            json!({ "request_id": request_id, "decision": "reject" }),
+        );
+        assert_eq!(reply["status"], "rejected");
+
+        let (resumed, events) = call_rpc(
+            &mut state,
+            3,
+            "agent.resume",
+            json!({ "session_id": session_id }),
+        );
+        assert_eq!(resumed["resumed"], true);
+        assert_eq!(resumed["run_state"], "idle");
+        assert_eq!(resumed["tool_calls"][0]["tool_name"], "capture.start");
+        assert_eq!(resumed["tool_calls"][0]["status"], "aborted");
+        assert!(
+            resumed["assistant_message"]["parts"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("替代方案")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["method"] == "agent.tool.failed")
+        );
+
+        let (resume_again, _) = call_rpc_raw(
+            &mut state,
+            4,
+            "agent.resume",
+            json!({ "session_id": session_id }),
+        );
+        assert_eq!(
+            resume_again.error.expect("no continuation error").code,
+            -32013
+        );
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn offline_pcap_plan_runs_through_agent_loop_directly() {
+        if !tshark_available() {
+            return;
+        }
+
+        let db_path = temp_db_path("phase12-offline-plan");
+        let pcap_path = temp_pcap_path("phase12-offline-plan");
+        write_test_dns_pcap(&pcap_path);
+        let pcap_path_str = pcap_path.to_str().expect("pcap path").to_string();
+        let mut state = test_core_state(&db_path);
+
+        let (result, events) = call_rpc(
+            &mut state,
+            1,
+            "agent.ask",
+            json!({ "input": format!("请分析本地 pcap 文件 {pcap_path_str} 中的 DNS 异常并生成报告") }),
+        );
+        assert_eq!(result["run_state"], "idle");
+        let tool_names = result["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|call| call["tool_name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_names,
+            vec!["pcap.open", "dns.detect_anomalies", "report.generate", "ioc.export"]
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["method"] == "finding.created")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["method"] == "report.generated")
+        );
+        assert!(
+            result["assistant_message"]["parts"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("NXDOMAIN")
+        );
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(pcap_path);
     }
 }

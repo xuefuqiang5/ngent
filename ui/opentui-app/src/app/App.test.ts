@@ -6,7 +6,14 @@ import {
   initialState,
   type AppState,
 } from "./state"
-import { applyChatInputKey, reduceEvent, summarizeCoreEvent } from "./App"
+import {
+  applyChatInputKey,
+  readLatestSession,
+  readRestoredChatMessages,
+  readRestoredToolEvents,
+  reduceEvent,
+  summarizeCoreEvent,
+} from "./App"
 
 describe("App event reducer", () => {
   test("upserts duplicate finding events by id", () => {
@@ -144,6 +151,34 @@ describe("App event reducer", () => {
     })
   })
 
+  test("summarizes persisted goal analysis without exposing hidden reasoning", () => {
+    const [event] = readRestoredToolEvents({
+      messages: [
+        {
+          id: "msg_plan_0001",
+          role: "assistant",
+          parts: [
+            {
+              id: "part_plan_0001",
+              kind: "reasoning",
+              content: JSON.stringify({
+                objective: "Inspect stored evidence",
+                selected_tools: ["flow.list", "finding.list"],
+              }),
+            },
+          ],
+        },
+      ],
+      tool_calls: [],
+    })
+
+    expect(summarizeCoreEvent(event)).toEqual({
+      title: "Goal analyzed",
+      detail: "Inspect stored evidence · plan: flow.list, finding.list",
+      status: "done",
+    })
+  })
+
   test("does not promote raw message events into work trace", () => {
     expect(
       summarizeCoreEvent({
@@ -156,6 +191,137 @@ describe("App event reducer", () => {
         },
       }),
     ).toBe(null)
+  })
+
+  test("reads latest persisted session from core payload", () => {
+    expect(
+      readLatestSession({
+        sessions: [
+          {
+            id: "ses_0002",
+            mode: "observe",
+            run_state: "idle",
+            max_steps: 8,
+          },
+          {
+            id: "ses_0001",
+            mode: "observe",
+          },
+        ],
+      }),
+    ).toEqual({
+      id: "ses_0002",
+      mode: "observe",
+      run_state: "idle",
+      max_steps: 8,
+    })
+  })
+
+  test("converts persisted messages into bounded chat messages", () => {
+    expect(
+      readRestoredChatMessages({
+        messages: [
+          {
+            id: "msg_0001",
+            role: "user",
+            parts: [{ id: "part_0001", kind: "text", content: "hello" }],
+          },
+          {
+            id: "msg_0002",
+            role: "assistant",
+            parts: [
+              { id: "part_0002", kind: "tool_call", content: "hidden" },
+              { id: "part_0003", kind: "text", content: "hi there" },
+            ],
+          },
+          {
+            id: "msg_0003",
+            role: "tool",
+            parts: [{ id: "part_0004", kind: "text", content: "tool result" }],
+          },
+        ],
+      }),
+    ).toEqual([
+      {
+        id: "msg_0001",
+        role: "user",
+        status: "sent",
+        content: "hello",
+      },
+      {
+        id: "msg_0002",
+        role: "assistant",
+        status: "sent",
+        content: "hi there",
+      },
+      {
+        id: "msg_0003",
+        role: "system",
+        status: "sent",
+        content: "tool result",
+      },
+    ])
+  })
+
+  test("restores persisted tool lifecycle as bounded work trace events", () => {
+    const events = readRestoredToolEvents({
+      messages: [
+        {
+          id: "msg_tool_result_0001",
+          role: "tool",
+          parts: [
+            {
+              id: "part_tool_result_0001",
+              kind: "tool_result",
+              content: JSON.stringify({
+                call_id: "call_0001",
+                result: {
+                  summary: "Found 3 stored flows; returned 3.",
+                },
+              }),
+            },
+          ],
+        },
+      ],
+      tool_calls: [
+        {
+          id: "call_0001",
+          tool_name: "flow.list",
+          input: '{"limit":20}',
+          status: "completed",
+        },
+        {
+          id: "call_0002",
+          tool_name: "capture.start",
+          input: '{"duration":10}',
+          status: "pending",
+        },
+        {
+          id: "call_0003",
+          tool_name: "artifact.summary",
+          input: "{}",
+          status: "aborted",
+        },
+      ],
+    })
+
+    expect(events.map(summarizeCoreEvent)).toEqual([
+      {
+        title: "Tool completed",
+        detail: "flow.list · Found 3 stored flows; returned 3.",
+        status: "done",
+      },
+      {
+        title: "Running tool",
+        detail: "capture.start",
+        status: "running",
+      },
+      {
+        title: "Tool did not complete",
+        detail: "artifact.summary",
+        status: "error",
+      },
+    ])
   })
 })
 

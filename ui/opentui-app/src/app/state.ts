@@ -17,6 +17,9 @@ export type DashboardSnapshot = {
   eventCount: number
   interfaces: string[]
   runState: string
+  agentTools: string[]
+  llmEnabled: boolean
+  llmModel: string
 }
 
 export type PendingApproval = {
@@ -44,6 +47,42 @@ export type ChatMessage = {
   role: "user" | "assistant" | "system"
   status: "sending" | "sent" | "error"
   content: string
+}
+
+export type PersistedSessionSummary = {
+  id: string
+  mode?: string
+  run_state?: string
+  max_steps?: number
+}
+
+export type PersistedMessagePart = {
+  id?: string
+  kind?: string
+  content?: string
+}
+
+export type PersistedMessage = {
+  id: string
+  session_id?: string
+  role?: string
+  parts?: PersistedMessagePart[]
+}
+
+export type PersistedToolCall = {
+  id?: string
+  session_id?: string
+  step_id?: string
+  tool_name?: string
+  input?: string
+  status?: string
+}
+
+export type PersistedSessionSnapshot = {
+  session?: PersistedSessionSummary
+  messages?: PersistedMessage[]
+  tool_calls?: PersistedToolCall[]
+  pending_permissions?: PendingApproval[]
 }
 
 export type SessionStatus = "idle" | "busy" | "retry"
@@ -130,6 +169,9 @@ export function initialState(): AppState {
       eventCount: 0,
       interfaces: [],
       runState: "booting",
+      agentTools: [],
+      llmEnabled: false,
+      llmModel: "local planner",
     },
     alerts: [],
     events: [],

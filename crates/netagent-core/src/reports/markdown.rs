@@ -1,6 +1,9 @@
 use netagent_models::{ArtifactKind, ArtifactRef, DnsEvent, Finding, Flow};
 use serde::Serialize;
 
+use crate::storage::artifact_store::ArtifactStore;
+use crate::storage::sqlite::SqliteStore;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EvidenceBundleMetadata {
     pub finding_count: usize,
@@ -20,6 +23,20 @@ pub struct MarkdownReportInput {
     pub flows: Vec<Flow>,
     pub dns_events: Vec<DnsEvent>,
     pub artifacts: Vec<ArtifactRef>,
+}
+
+pub fn collect_report_input(
+    store: &SqliteStore,
+    artifact_store: &ArtifactStore,
+    title: &str,
+) -> Result<MarkdownReportInput, String> {
+    Ok(MarkdownReportInput {
+        title: title.to_string(),
+        findings: store.list_findings()?,
+        flows: store.list_flows()?,
+        dns_events: store.list_dns_events()?,
+        artifacts: artifact_store.list_artifacts(),
+    })
 }
 
 pub fn build_markdown_report(input: &MarkdownReportInput) -> (String, EvidenceBundleMetadata) {

@@ -1,6 +1,6 @@
 # State Architecture Refactor Plan
 
-> **Current project phase:** Phase 9 partial — User-Assistant Interaction Maturity (per `netagent_build_spec.md`)
+> **Current project phase:** Phase 11 complete — LLM Tool-Calling Foundation (per `netagent_build_spec.md`)
 > **Implementation status:** P0 and P1 are implemented. P2 capture tool modeling is deferred to Phase 12.
 > **Anti-drift compliance:** This refactor addresses the rule *"Do not let UI or harness execute system commands directly."*
 
@@ -13,7 +13,7 @@
 - `viewMode` is derived via `deriveViewMode(state)` and must not be manually written.
 - Prompt submission is gated by `canSubmitPrompt(state)`.
 - `Ctrl+X` no longer calls `capture.stop`; do not reintroduce direct UI capture-control shortcuts.
-- P2 capture tool modeling requires backend LLM tool-calling infrastructure and must wait until Phase 12.
+- The backend read-only LLM tool-calling foundation is complete. P2 capture tool modeling is the next Phase 12 gate and still requires the Agent loop to pause/resume around permission decisions.
 
 ---
 

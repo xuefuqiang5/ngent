@@ -1,5 +1,6 @@
-# Phase 0 placeholder. Permission state machine is not implemented yet.
+# Example project-level permission policy. The Core permission state machine is
+# implemented; keep the default in prompt mode so capture still requires an
+# explicit once/always decision unless a matching rule is persisted.
 version: 1
 default_mode: prompt
 rules: []
-

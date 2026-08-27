@@ -1,8 +1,8 @@
 # NetAgent OpenTUI UI Design
 
-> Current project phase: Phase 9 partial — User-Assistant Interaction Maturity.
-> Scope: UI clarity, layout, and resize robustness only.
-> Out of scope: new capture controls, LLM tool-calling, Zeek/Suricata, external intelligence, firewall actions, and session persistence.
+> Current project phase: Phase 11 complete — LLM Tool-Calling Foundation.
+> Scope: the implemented conversation-first UI, persisted session recovery, bounded read-only tool traces, approval flow, and resize robustness.
+> Out of scope until later gates: direct UI capture controls, Zeek/Suricata, external intelligence, and firewall actions. Agent-controlled `capture.start` remains the Phase 12 gate.
 
 ## Design Goal
 

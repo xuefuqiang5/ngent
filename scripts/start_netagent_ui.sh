@@ -12,19 +12,8 @@ if ! command -v bun >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ -z "${NETAGENT_LLM_API_KEY:-}" ]]; then
-  echo "NETAGENT_LLM_API_KEY is not set." >&2
-  exit 1
-fi
-
-if [[ -z "${NETAGENT_LLM_API_BASE:-}" ]]; then
-  echo "NETAGENT_LLM_API_BASE is not set." >&2
-  exit 1
-fi
-
-if [[ -z "${NETAGENT_LLM_MODEL:-}" ]]; then
-  echo "NETAGENT_LLM_MODEL is not set." >&2
-  exit 1
+if [[ -z "${NETAGENT_LLM_API_KEY:-}" || -z "${NETAGENT_LLM_MODEL:-}" ]]; then
+  echo "LLM is not configured; starting the deterministic Phase 11 demo planner." >&2
 fi
 
 cd "$UI_DIR"

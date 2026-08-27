@@ -11,7 +11,13 @@ pub enum AgentMode {
 pub enum RunState {
     Idle,
     Busy,
+    WaitingPermission,
+    RunningTool,
     Capturing,
+    Analyzing,
+    Reporting,
+    Retrying,
+    Compacting,
     Canceling,
     Error,
 }
@@ -28,6 +34,7 @@ pub enum MessageRole {
 #[serde(rename_all = "snake_case")]
 pub enum MessagePartKind {
     Text,
+    Reasoning,
     ToolCall,
     ToolResult,
 }
@@ -39,6 +46,7 @@ pub enum StepStatus {
     Completed,
     Failed,
     Aborted,
+    WaitingPermission,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +57,7 @@ pub enum ToolCallStatus {
     Completed,
     Error,
     Aborted,
+    WaitingPermission,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

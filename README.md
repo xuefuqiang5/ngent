@@ -1,6 +1,6 @@
 # NetAgent
 
-This README only covers how to start the project locally.
+NetAgent is a permission-aware terminal agent for network investigation. The Phase 12 demo shows a complete investigate loop: the Agent plans, requests a live capture through the Permission State Machine, and when the user rejects with feedback it automatically replans with offline pcap analysis, finds the anomaly, and produces a report and IOC export. Everything — plans, tool calls, results, permission decisions — is persisted in SQLite and survives Core/TUI restarts.
 
 ## Prerequisites
 
@@ -25,7 +25,16 @@ export NETAGENT_LLM_API_BASE="https://api.openai.com/v1"
 export NETAGENT_LLM_MODEL="gpt-4.1-mini"
 ```
 
-The core will fall back to a local mock response when these variables are absent.
+The LLM settings are optional. When they are absent, the same typed Tool Runtime is driven by a deterministic local planner, so the complete demo works without an API key.
+
+The Core reads `.env.local` and `.env` from the repository root itself. Both `./scripts/start_netagent_ui.sh` and a direct `bun run start` therefore load the configured model consistently. Set `NETAGENT_LLM_DISABLED=1` only when you explicitly want the offline planner.
+
+Conversation state is stored in SQLite. Set an explicit path when you want an isolated demo database:
+
+```bash
+export NETAGENT_DB_PATH="/tmp/netagent-demo.db"
+export NETAGENT_ARTIFACT_DIR="/tmp/netagent-demo-artifacts"
+```
 
 The core uses stdio JSON-RPC. You can verify that it starts correctly with:
 
@@ -41,19 +50,54 @@ printf '{"jsonrpc":"2.0","id":1,"method":"core.capabilities","params":{}}\n' | c
 
 ## Start the OpenTUI app
 
-Install UI dependencies and start the terminal app:
+Install UI dependencies once, then start the terminal app from the repository root:
 
 ```bash
-cd ui/opentui-app
-bun install
-bun run dev
+cd ui/opentui-app && bun install && cd ../..
+./scripts/start_netagent_ui.sh
 ```
 
-You can also use:
+The TUI starts and connects to the Rust Core itself; do not start a second Core process for this path. You can also start it directly from the UI directory:
 
 ```bash
 bun run start
 ```
+
+## Current agent tools
+
+The model/local planner can call 12 typed Phase 12 tools. All are executed by the Rust Tool Runtime with full session/message/part/call context, and every result is a bounded summary plus structured output and `ArtifactRef` values — raw packet or command output never enters the model context:
+
+- `flow.list` / `finding.list` — list up to 25 stored flows/findings.
+- `capture.status` — inspect capture state without starting or stopping capture.
+- `artifact.list` / `artifact.summary` — list/describe artifact references without raw contents.
+- `capture.start` — request a bounded live capture. The Agent loop pauses and the Core raises a `PermissionRequest` (tool, risk, command preview, interface, filter, duration). `agent.resume` continues the loop after the user decides; rejection feedback makes the Agent replan (offline pcap analysis by default). `capture.stop` is deliberately not an agent tool.
+- `pcap.open` / `tshark.extract_flows` / `tshark.extract_dns` — parse and persist offline pcap evidence.
+- `dns.detect_anomalies` — NXDOMAIN spike rule over stored DNS events; creates `finding.created`.
+- `report.generate` / `ioc.export` — Markdown evidence report and IOC JSON document artifacts.
+
+The Core also exposes session recovery, capture RPCs, and a bounded mock-output RPC; inspect the exact RPC/event list with `core.capabilities`.
+
+For every request, the Agent persists and displays a concise execution brief containing the objective, Observe-mode scope, candidate/selected tools, constraints, success criteria, and whether permission is required. This is a bounded plan summary, not hidden chain-of-thought.
+
+## Demo flow
+
+In the TUI:
+
+1. Ask `目标：判断当前已经保存了哪些网络证据。请先分析目标并制定计划，再调用只读工具，最后区分已知项和未知项。`.
+2. Watch the TUI show the configured model, the 12 available Agent tools, goal analysis, selected tools, bounded observations, and final answer.
+3. Ask `请抓包看看当前网络是否有异常流量`. The agent calls `capture.start`, the Core raises a permission request, and the Approval Modal appears with the command preview.
+4. Press `F` (reject with feedback) to watch the Agent replan with offline pcap analysis. Press `N` for a plain rejection. Press `Y`/`A` only when the host allows `tcpdump`.
+5. Restart the TUI. The latest conversation, tool-call/result parts, and any still-pending approval are restored from SQLite.
+
+For deterministic Core-only demos that require no API key and no live-capture privileges:
+
+```bash
+./scripts/demo_phase11.sh   # read-only tool loop + restart recovery
+./scripts/demo_phase12.sh   # discover -> plan -> capture permission -> reject-with-feedback
+                            # -> offline pcap analysis -> finding/report/IOC -> recovery
+```
+
+`demo_phase12.sh` generates its own DNS NXDOMAIN fixture pcap (via `cargo run --example gen_fixture`) inside an isolated temporary database/artifact directory.
 
 ## Useful startup checks
 

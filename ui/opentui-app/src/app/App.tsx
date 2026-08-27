@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import type { KeyEvent } from "@opentui/core"
 import { useKeyboard, useRenderer } from "@opentui/react"
 import type { CoreEvent } from "../harness/event_router"
@@ -8,7 +8,12 @@ import type {
   AlertItem,
   AppState,
   CaptureState,
+  ChatMessage,
   DashboardSnapshot,
+  PersistedMessage,
+  PersistedSessionSnapshot,
+  PersistedSessionSummary,
+  PersistedToolCall,
   PendingApproval,
 } from "./state"
 import {
@@ -31,6 +36,9 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
   const renderer = useRenderer()
   const [state, setState] = useState<AppState>(initialState())
   const viewMode = deriveViewMode(state)
+  const sessionIdRef = useRef<string | undefined>(undefined)
+  const resumeInFlightRef = useRef(false)
+  sessionIdRef.current = state.session.sessionId
 
   useEffect(() => {
     let mounted = true
@@ -38,6 +46,9 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
     const unsubscribe = eventRouter.onEvent((event) => {
       if (!mounted) return
       setState((current: AppState) => reduceEvent(current, event))
+      if (event.method === "pcap.created" || event.method === "capture.stopped") {
+        void tryResumeSession()
+      }
     })
 
     void hydrate()
@@ -48,6 +59,20 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
       void transport.close()
     }
   }, [eventRouter, rpc, transport])
+
+  async function tryResumeSession(): Promise<void> {
+    const sessionId = sessionIdRef.current
+    if (!sessionId || resumeInFlightRef.current) return
+    resumeInFlightRef.current = true
+    try {
+      await rpc.request("agent.resume", { session_id: sessionId })
+    } catch {
+      // No continuation (or capture still running) is expected; the UI stays
+      // read-only and retries after the next pcap.created/capture.stopped.
+    } finally {
+      resumeInFlightRef.current = false
+    }
+  }
 
   useEffect(() => {
     if (state.sync.status !== "ready") return
@@ -109,7 +134,12 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
     [state.session.messages],
   )
   const workTrace = useMemo(
-    () => state.events.map(summarizeCoreEvent).filter(isTraceItem).slice(-6),
+    () =>
+      state.events
+        .map(summarizeCoreEvent)
+        .filter(isTraceItem)
+        .filter((item) => item.title !== "Tool progress")
+        .slice(-12),
     [state.events],
   )
   const findings = useMemo(() => state.alerts.slice(-3).reverse(), [state.alerts])
@@ -126,12 +156,28 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
         rpc.request("system.list_interfaces"),
         rpc.request("permission.list_pending"),
       ])
-      const captureStatus = await rpc.request("capture.status")
+      const [captureStatus, sessions] = await Promise.all([
+        rpc.request("capture.status"),
+        rpc.request("session.list"),
+      ])
+      const restoredSession = readLatestSession(sessions)
+      const restoredSnapshot = restoredSession
+        ? await rpc.request("session.get", { session_id: restoredSession.id })
+        : undefined
+      const restoredChat = restoredSession
+        ? readRestoredChatMessages(restoredSnapshot)
+        : undefined
+      const restoredToolEvents = readRestoredToolEvents(restoredSnapshot)
+      const dashboardSnapshot = buildSnapshot(capabilities, interfaces)
 
       setState((current: AppState) => ({
         ...current,
         sync: { status: "ready" },
-        dashboard: buildSnapshot(capabilities, interfaces),
+        dashboard: {
+          ...dashboardSnapshot,
+          runState:
+            restoredSession?.run_state ?? dashboardSnapshot.runState,
+        },
         capture: readCaptureSnapshot(captureStatus),
         permission: {
           ...current.permission,
@@ -139,11 +185,19 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
         },
         session: {
           ...current.session,
-          messages: markSystemMessage(
-            current.session.messages,
-            "Core connected. Continue the session or ask a new question.",
-          ),
+          sessionId: restoredSession?.id ?? current.session.sessionId,
+          status: restoredSessionStatus(restoredSession),
+          messages: restoredChat
+            ? markSystemMessage(
+                restoredChat,
+                `Restored session ${restoredSession?.id}.`,
+              )
+            : markSystemMessage(
+                current.session.messages,
+                "Core connected. Continue the session or ask a new question.",
+              ),
         },
+        events: mergeRestoredToolEvents(restoredToolEvents, current.events),
       }))
     } catch (error) {
       setState((current: AppState) => ({
@@ -275,6 +329,7 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
         },
       }))
       await refreshCaptureStatus()
+      await tryResumeSession()
     } finally {
       setState((current: AppState) => ({
         ...current,
@@ -336,6 +391,8 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
             </box>
           ) : null}
 
+          <AgentCapabilityStrip snapshot={state.dashboard} />
+
           <InlinePermissionCard request={state.permission.pending[0]} />
 
           <FindingsStrip findings={findings} totalCount={state.alerts.length} />
@@ -392,6 +449,206 @@ function markSystemMessage(messages: AppState["session"]["messages"], content: s
   return [{ ...first, status: "sent" as const, content }, ...rest]
 }
 
+export function readLatestSession(payload: unknown): PersistedSessionSummary | undefined {
+  const sessions = (payload as { sessions?: unknown }).sessions
+  if (!Array.isArray(sessions)) return undefined
+
+  const first = sessions[0] as Partial<PersistedSessionSummary> | undefined
+  if (!first || typeof first.id !== "string" || first.id.length === 0) {
+    return undefined
+  }
+
+  return {
+    id: first.id,
+    mode: typeof first.mode === "string" ? first.mode : undefined,
+    run_state: typeof first.run_state === "string" ? first.run_state : undefined,
+    max_steps: typeof first.max_steps === "number" ? first.max_steps : undefined,
+  }
+}
+
+export function readRestoredChatMessages(payload: unknown): ChatMessage[] {
+  const messages = (payload as { messages?: unknown }).messages
+  if (!Array.isArray(messages)) return []
+
+  return messages
+    .map((item) => normalizePersistedMessage(item))
+    .filter((item): item is ChatMessage => item !== null)
+}
+
+export function readRestoredToolEvents(payload: unknown): CoreEvent[] {
+  const snapshot = payload as PersistedSessionSnapshot | undefined
+  const toolCalls = snapshot?.tool_calls
+  const goalEvents = readPersistedGoalEvents(snapshot?.messages)
+  if (!Array.isArray(toolCalls)) return goalEvents
+  const resultSummaries = readPersistedToolResultSummaries(snapshot?.messages)
+
+  return [
+    ...goalEvents,
+    ...toolCalls
+    .map((toolCall) =>
+      restoredToolEvent(
+        toolCall,
+        typeof toolCall.id === "string"
+          ? resultSummaries.get(toolCall.id)
+          : undefined,
+      ),
+    )
+    .filter((event): event is CoreEvent => event !== null),
+  ]
+}
+
+function readPersistedGoalEvents(
+  messages: PersistedMessage[] | undefined,
+): CoreEvent[] {
+  if (!Array.isArray(messages)) return []
+  const events: CoreEvent[] = []
+  for (const message of messages) {
+    for (const part of message.parts ?? []) {
+      if (part.kind !== "reasoning" || typeof part.content !== "string") continue
+      try {
+        const goalAnalysis = JSON.parse(part.content) as unknown
+        events.push({
+          method: "agent.reasoning.ended",
+          params: {
+            message_id: message.id,
+            part_id: part.id,
+            goal_analysis: goalAnalysis,
+          },
+        })
+      } catch {
+        // Ignore malformed legacy reasoning parts.
+      }
+    }
+  }
+  return events
+}
+
+function readPersistedToolResultSummaries(
+  messages: PersistedMessage[] | undefined,
+): Map<string, string> {
+  const summaries = new Map<string, string>()
+  if (!Array.isArray(messages)) return summaries
+
+  for (const message of messages) {
+    for (const part of message.parts ?? []) {
+      if (part.kind !== "tool_result" || typeof part.content !== "string") continue
+      try {
+        const envelope = JSON.parse(part.content) as {
+          call_id?: unknown
+          result?: { summary?: unknown }
+        }
+        if (
+          typeof envelope.call_id === "string" &&
+          typeof envelope.result?.summary === "string"
+        ) {
+          summaries.set(envelope.call_id, envelope.result.summary)
+        }
+      } catch {
+        // Ignore malformed legacy parts and preserve the tool-call status trace.
+      }
+    }
+  }
+  return summaries
+}
+
+function mergeRestoredToolEvents(
+  restored: CoreEvent[],
+  current: CoreEvent[],
+): CoreEvent[] {
+  const restoredIds = new Set(restored.map(readAgentEventId).filter(Boolean))
+  return [
+    ...restored,
+    ...current.filter((event) => {
+      const id = readAgentEventId(event)
+      return !id || !restoredIds.has(id)
+    }),
+  ]
+}
+
+function readAgentEventId(event: CoreEvent): string | undefined {
+  return readToolCallId(event) ?? getString(event.params, "message_id")
+}
+
+function readToolCallId(event: CoreEvent): string | undefined {
+  return (
+    getString(event.params, "tool_call_id") ??
+    getString((event.params as { tool_call?: unknown }).tool_call, "id")
+  )
+}
+
+function restoredToolEvent(
+  toolCall: PersistedToolCall,
+  summary?: string,
+): CoreEvent | null {
+  if (typeof toolCall.tool_name !== "string") return null
+
+  if (toolCall.status === "completed") {
+    return {
+      method: "agent.tool.success",
+      params: { tool_call: toolCall, summary },
+    }
+  }
+  if (toolCall.status === "error" || toolCall.status === "aborted") {
+    return {
+      method: "agent.tool.failed",
+      params: { tool_call: toolCall, summary },
+    }
+  }
+  return { method: "agent.tool.called", params: { tool_call: toolCall } }
+}
+
+function restoredSessionStatus(
+  session: PersistedSessionSummary | undefined,
+): AppState["session"]["status"] {
+  if (!session?.run_state) return "idle"
+  if (session.run_state === "error" || session.run_state === "retrying") {
+    return "retry"
+  }
+  if (
+    [
+      "busy",
+      "running_tool",
+      "capturing",
+      "analyzing",
+      "reporting",
+      "compacting",
+      "canceling",
+    ].includes(session.run_state)
+  ) {
+    return "busy"
+  }
+  return "idle"
+}
+
+function normalizePersistedMessage(payload: unknown): ChatMessage | null {
+  const message = payload as Partial<PersistedMessage>
+  if (typeof message.id !== "string") return null
+
+  const role = normalizeChatRole(message.role)
+  if (!role) return null
+
+  const content = (message.parts ?? [])
+    .filter((part) => part.kind === "text" && typeof part.content === "string")
+    .map((part) => part.content)
+    .join("\n")
+    .trim()
+
+  if (!content) return null
+
+  return {
+    id: message.id,
+    role,
+    status: "sent",
+    content,
+  }
+}
+
+function normalizeChatRole(role: unknown): ChatMessage["role"] | null {
+  if (role === "user" || role === "assistant") return role
+  if (role === "tool") return "system"
+  return null
+}
+
 function ThreadMessage(props: {
   message: AppState["session"]["messages"][number]
 }) {
@@ -423,6 +680,22 @@ function ThreadMessage(props: {
   return (
     <box flexDirection="column" marginBottom={1}>
       <text fg="#e2e8f0">{truncate(props.message.content, 420)}</text>
+    </box>
+  )
+}
+
+function AgentCapabilityStrip(props: { snapshot: DashboardSnapshot }) {
+  const model = props.snapshot.llmEnabled
+    ? props.snapshot.llmModel
+    : "deterministic local planner"
+  const tools =
+    props.snapshot.agentTools.length > 0
+      ? props.snapshot.agentTools.join(" · ")
+      : "no agent tools advertised"
+  return (
+    <box flexDirection="column" marginTop={1}>
+      <text fg="#64748b">{`Agent: ${model}`}</text>
+      <text fg="#64748b">{`Tools: ${truncate(tools, 180)}`}</text>
     </box>
   )
 }
@@ -518,6 +791,31 @@ function FindingsStrip(props: { findings: AlertItem[]; totalCount: number }) {
 }
 
 export function summarizeCoreEvent(event: CoreEvent): TraceItem | null {
+  if (event.method === "agent.reasoning.started") {
+    return {
+      title: "Analyzing goal",
+      detail: "building a bounded execution plan",
+      status: "running",
+    }
+  }
+
+  if (event.method === "agent.reasoning.ended") {
+    const analysis = (event.params as { goal_analysis?: unknown }).goal_analysis
+    const objective = getString(analysis, "objective") ?? "goal analyzed"
+    const selectedTools = (analysis as { selected_tools?: unknown })?.selected_tools
+    const toolSummary = Array.isArray(selectedTools)
+      ? selectedTools.filter((tool): tool is string => typeof tool === "string").join(", ")
+      : ""
+    return {
+      title: "Goal analyzed",
+      detail: truncate(
+        toolSummary ? `${objective} · plan: ${toolSummary}` : objective,
+        180,
+      ),
+      status: "done",
+    }
+  }
+
   if (event.method === "agent.step.started") {
     return {
       title: "Thinking through request",
@@ -551,10 +849,25 @@ export function summarizeCoreEvent(event: CoreEvent): TraceItem | null {
   }
 
   if (event.method === "agent.tool.success") {
+    const summary = getString(event.params, "summary")
     return {
       title: "Tool completed",
-      detail: readToolName(event.params),
+      detail: summary
+        ? `${readToolName(event.params)} · ${truncate(summary, 140)}`
+        : readToolName(event.params),
       status: "done",
+    }
+  }
+
+  if (event.method === "agent.tool.failed") {
+    const detail =
+      getString(event.params, "summary") ??
+      getString(event.params, "message") ??
+      readToolName(event.params)
+    return {
+      title: "Tool did not complete",
+      detail: truncate(detail, 140),
+      status: "error",
     }
   }
 
@@ -669,6 +982,8 @@ function buildSnapshot(capabilities: unknown, interfaces: unknown): DashboardSna
     methods?: unknown[]
     events?: unknown[]
     phase?: string
+    agent_tools?: Array<{ id?: string }>
+    llm?: { enabled?: boolean; model?: string }
   }
   const network = interfaces as { interfaces?: Array<{ name?: string }> }
 
@@ -678,6 +993,11 @@ function buildSnapshot(capabilities: unknown, interfaces: unknown): DashboardSna
     eventCount: caps.events?.length ?? 0,
     interfaces: (network.interfaces ?? []).map((item) => item.name ?? "unknown"),
     runState: caps.phase ?? "unknown",
+    agentTools: (caps.agent_tools ?? [])
+      .map((tool) => tool.id)
+      .filter((id): id is string => typeof id === "string"),
+    llmEnabled: caps.llm?.enabled ?? false,
+    llmModel: caps.llm?.model ?? "local planner",
   }
 }
 

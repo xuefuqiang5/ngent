@@ -51,6 +51,14 @@ impl PermissionManager {
         self.pending.values().cloned().collect()
     }
 
+    pub fn restore_pending(&mut self, request: PermissionRequest) {
+        self.pending.insert(request.id.clone(), request);
+    }
+
+    pub fn remove_pending(&mut self, request_id: &str) -> Option<PermissionRequest> {
+        self.pending.remove(request_id)
+    }
+
     pub fn evaluate(&self, permission: PermissionKind, patterns: &[String]) -> bool {
         let rules = self.merge_rulesets();
         patterns.iter().any(|pattern| {
