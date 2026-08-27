@@ -28,10 +28,12 @@ export type PendingApproval = {
   permission: string
   risk: string
   patterns: string[]
+  require_typed_confirmation?: boolean
   metadata: {
     tool: string
     command_preview: string
     reason: string
+    confirm_phrase?: string
   }
 }
 

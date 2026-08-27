@@ -23,7 +23,9 @@ use crate::reports::markdown::{
     EvidenceBundleMetadata, build_evidence_bundle_metadata, build_markdown_report,
     collect_report_input,
 };
-use crate::runtime::tool_registry::{ToolContext, ToolPermissionContext, ToolRegistry};
+use crate::runtime::tool_registry::{
+    FirewallRuleProposal, ToolContext, ToolPermissionContext, ToolRegistry,
+};
 use crate::storage::artifact_store::ArtifactStore;
 use crate::storage::sqlite::SqliteStore;
 use crate::tools::tshark;
@@ -32,7 +34,7 @@ use netagent_models::{
     PermissionReplyKind, PermissionRequest, RiskLevel, RunState, StepStatus, ToolCallStatus,
     ToolRef,
 };
-use netagent_models::{ArtifactRef, DnsEvent, Finding, Flow, ToolCall};
+use netagent_models::{ArtifactKind, ArtifactRef, DnsEvent, Finding, Flow, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -79,6 +81,7 @@ struct CoreState {
     sqlite_store: SqliteStore,
     capture_job: Option<CaptureJob>,
     pending_capture: Option<PendingCapture>,
+    pending_respond: Option<PendingRespond>,
     permission_counter: u64,
     capture_counter: u64,
     tool_counter: u64,
@@ -93,6 +96,14 @@ struct PendingCapture {
     interface: String,
     filter: String,
     duration_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingRespond {
+    request_id: String,
+    session_id: String,
+    tool_call_id: String,
+    proposal: FirewallRuleProposal,
 }
 
 #[derive(Debug)]
@@ -163,6 +174,7 @@ fn run() -> io::Result<()> {
         sqlite_store,
         capture_job: None,
         pending_capture: None,
+        pending_respond: None,
         permission_counter: 0,
         capture_counter: 0,
         tool_counter: 0,
@@ -231,9 +243,9 @@ fn run() -> io::Result<()> {
             jsonrpc: JSON_RPC_VERSION,
             method: "event.core.ready",
             params: json!({
-                "phase": "phase12",
+                "phase": "phase13",
                 "protocol_version": JSON_RPC_VERSION,
-                "message": "NetAgent core ready - Phase 12 agent-controlled capture tool."
+                "message": "NetAgent core ready - Phase 13 respond proposal preview."
             }),
         },
     )?;
@@ -305,12 +317,12 @@ fn handle_request<W: Write>(
     let result = match request.method.as_str() {
         "system.ping" => Ok(json!({
             "ok": true,
-            "phase": "phase12",
+            "phase": "phase13",
             "message": "pong"
         })),
         "core.capabilities" => Ok(json!({
             "protocol_version": JSON_RPC_VERSION,
-            "phase": "phase12",
+            "phase": "phase13",
             "methods": [
                 "system.ping",
                 "core.capabilities",
@@ -362,7 +374,8 @@ fn handle_request<W: Write>(
                 "capture.started",
                 "capture.stopped",
                 "pcap.created",
-                "report.generated"
+                "report.generated",
+                "respond.proposal.created"
             ],
             "llm": state.agent_runtime.llm_status(),
             "agent_tools": state.tool_registry.agent_defs(),
@@ -447,12 +460,7 @@ fn handle_request<W: Write>(
             emit_agent_turn_events(writer, &turn)?;
             let mut result = AgentRuntime::build_agent_response(&turn);
             if let Some(pending) = &turn.pending_permission {
-                match finalize_agent_capture_permission(
-                    state,
-                    writer,
-                    &turn.session_finished.id,
-                    pending,
-                ) {
+                match finalize_agent_pending_permission(state, writer, &turn.session_finished.id, pending) {
                     Ok(proposal) => {
                         result["session"]["run_state"] = json!(RunState::WaitingPermission);
                         result["run_state"] = json!(RunState::WaitingPermission);
@@ -557,7 +565,7 @@ fn handle_request<W: Write>(
             }
             let mut result = AgentRuntime::build_agent_response(&turn);
             if let Some(pending) = &turn.pending_permission {
-                match finalize_agent_capture_permission(state, writer, session_id, pending) {
+                match finalize_agent_pending_permission(state, writer, session_id, pending) {
                     Ok(proposal) => {
                         result["session"]["run_state"] = json!(RunState::WaitingPermission);
                         result["run_state"] = json!(RunState::WaitingPermission);
@@ -769,7 +777,7 @@ fn emit_agent_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::Res
         json!({
             "step": turn.step,
             "run_state": turn.final_run_state,
-            "phase": "phase12",
+            "phase": "phase13",
             "llm": {
                 "used": turn.llm_used,
                 "model": turn.llm_model,
@@ -915,7 +923,7 @@ fn emit_resumed_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::R
     )?;
 
     for (index, activity) in turn.tool_activities.iter().enumerate() {
-        if index == 0 && activity.tool_call.tool_name == "capture.start" {
+        if index == 0 && turn.resumed {
             let (method, run_state) = if activity.tool_call.status == ToolCallStatus::Completed {
                 ("agent.tool.success", RunState::Analyzing)
             } else {
@@ -1021,7 +1029,7 @@ fn emit_resumed_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::R
         json!({
             "step": turn.step,
             "run_state": turn.final_run_state,
-            "phase": "phase12",
+            "phase": "phase13",
             "llm": {
                 "used": turn.llm_used,
                 "model": turn.llm_model,
@@ -1403,6 +1411,29 @@ fn run_agent_tool(
                 }),
             })
         }
+        "respond.propose_firewall_rule" => {
+            let proposal = tool_registry.validate_firewall_rule_input(&execution.input)?;
+            *permission_seq += 1;
+            let request_id = format!("per_agent_{permission_seed}_{permission_seq}");
+            let summary = format!(
+                "The agent proposes to block {target} (action={action}) based on stored evidence. This creates a review-only proposal; the firewall is never modified.",
+                target = proposal.target,
+                action = proposal.action,
+            );
+            Ok(ToolOutcome::PermissionPending {
+                request_id,
+                summary,
+                plan: json!({
+                    "finding_id": proposal.finding_id,
+                    "target": proposal.target,
+                    "port": proposal.port,
+                    "protocol": proposal.protocol,
+                    "action": proposal.action,
+                    "reason": proposal.reason,
+                    "kind": "firewall_rule_proposal",
+                }),
+            })
+        }
         "pcap.open"
         | "tshark.extract_flows"
         | "tshark.extract_dns"
@@ -1430,6 +1461,155 @@ fn run_agent_tool(
             )
             .map(ToolOutcome::Completed),
     }
+}
+
+/// Route a paused agent tool call to the right permission workflow:
+/// `capture.start` and `respond.propose_firewall_rule` are the two
+/// permission-gated agent tools in Phase 12/13.
+fn finalize_agent_pending_permission<W: Write>(
+    state: &mut CoreState,
+    writer: &mut W,
+    session_id: &str,
+    pending: &AgentPendingPermission,
+) -> Result<Value, RpcError> {
+    match pending.tool_call.tool_name.as_str() {
+        "respond.propose_firewall_rule" => {
+            finalize_agent_respond_permission(state, writer, session_id, pending)
+        }
+        _ => finalize_agent_capture_permission(state, writer, session_id, pending),
+    }
+}
+
+/// Turn a pending `respond.propose_firewall_rule` tool call into a high-risk
+/// typed-confirmation permission request. Approval only creates a review
+/// proposal artifact; nothing is executed against the firewall.
+fn finalize_agent_respond_permission<W: Write>(
+    state: &mut CoreState,
+    writer: &mut W,
+    session_id: &str,
+    pending: &AgentPendingPermission,
+) -> Result<Value, RpcError> {
+    let plan = &pending.plan;
+    let proposal = FirewallRuleProposal {
+        finding_id: plan
+            .get("finding_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty()),
+        target: plan
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("0.0.0.0")
+            .to_string(),
+        port: plan.get("port").and_then(Value::as_u64).map(|port| port as u16),
+        protocol: plan
+            .get("protocol")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty()),
+        action: plan
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("block")
+            .to_string(),
+        reason: plan
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("No reason provided.")
+            .to_string(),
+    };
+
+    state
+        .sqlite_store
+        .insert_tool_call(&pending.tool_call)
+        .map_err(|message| RpcError {
+            code: -32011,
+            message,
+        })?;
+
+    let confirm_phrase = format!("BLOCK {}", proposal.target);
+    let request = PermissionRequest {
+        id: pending.request_id.clone(),
+        session_id: session_id.to_string(),
+        permission: PermissionKind::ModifyFirewall,
+        patterns: vec![proposal.target.clone(), proposal.action.clone()],
+        always: vec![
+            format!("modify_firewall:{}:{}", proposal.target, proposal.action),
+        ],
+        risk: RiskLevel::High,
+        metadata: PermissionMetadata {
+            tool: String::from("respond.propose_firewall_rule"),
+            command_preview: format!(
+                "PREVIEW ONLY - pfctl rule would be: {action} from any to {target}{port} - NOT executed",
+                action = proposal.action,
+                target = proposal.target,
+                port = proposal
+                    .port
+                    .map(|port| format!(" port {port}"))
+                    .unwrap_or_default(),
+            ),
+            reason: pending.summary.clone(),
+            confirm_phrase: Some(confirm_phrase.clone()),
+        },
+        tool: ToolRef {
+            message_id: pending.call_message.id.clone(),
+            call_id: pending.tool_call.id.clone(),
+        },
+        require_typed_confirmation: true,
+    };
+
+    let _ = emit_event(
+        writer,
+        "agent.tool.progress",
+        json!({
+            "tool_call_id": pending.tool_call.id,
+            "status": "waiting_permission",
+            "message": pending.summary,
+        }),
+    );
+
+    // High-risk respond requests always need the modal + typed confirmation,
+    // even when an always-rule exists for the pattern.
+    let decision = state.permission_manager.ask(request.clone());
+    if decision == PermissionDecision::AllowedAlways {
+        state.permission_manager.restore_pending(request.clone());
+    }
+
+    let pending_respond = PendingRespond {
+        request_id: request.id.clone(),
+        session_id: session_id.to_string(),
+        tool_call_id: pending.tool_call.id.clone(),
+        proposal: proposal.clone(),
+    };
+    let continuation = serde_json::to_value(&pending_respond).map_err(|error| RpcError {
+        code: -32011,
+        message: format!("failed to encode pending respond: {error}"),
+    })?;
+    if let Err(message) =
+        state
+            .sqlite_store
+            .save_pending_permission(&request, &continuation)
+    {
+        state.permission_manager.remove_pending(&request.id);
+        let _ = state
+            .sqlite_store
+            .update_tool_call_status(&pending.tool_call.id, ToolCallStatus::Error);
+        return Err(RpcError {
+            code: -32011,
+            message,
+        });
+    }
+    state.pending_respond = Some(pending_respond);
+    set_session_run_state(state, session_id, RunState::WaitingPermission)?;
+    let _ = emit_event(writer, "permission.asked", json!({ "request": request }));
+
+    Ok(json!({
+        "status": "waiting_permission",
+        "request_id": request.id,
+        "require_typed_confirmation": true,
+        "confirm_phrase": confirm_phrase,
+        "proposal": proposal,
+    }))
 }
 
 /// Turn a pending `capture.start` tool call into a real permission request.
@@ -1482,11 +1662,13 @@ fn finalize_agent_capture_permission<W: Write>(
                 "tcpdump -i {interface} -nn -s 0 -w capture-{interface}.pcap {filter}"
             ),
             reason: pending.summary.clone(),
+            confirm_phrase: None,
         },
         tool: ToolRef {
             message_id: pending.call_message.id.clone(),
             call_id: pending.tool_call.id.clone(),
         },
+        require_typed_confirmation: false,
     };
 
     let _ = emit_event(
@@ -1564,17 +1746,31 @@ fn build_resume_outcome_summary(payload: &Value) -> String {
         .unwrap_or("rejected");
     match status {
         "approved" | "completed" => {
-            let artifact_id = payload
-                .pointer("/artifact/id")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let pcap = payload
-                .pointer("/capture/pcap_path")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            format!(
-                "Live capture was approved and completed. PCAP artifact {artifact_id} is at {pcap}. Raw packets were not returned; use offline tools on that pcap."
-            )
+            if let Some(proposal) = payload.get("proposal") {
+                let target = proposal
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let artifact_id = payload
+                    .pointer("/artifact/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                format!(
+                    "Firewall rule proposal approved (preview only): block {target}. Proposal artifact {artifact_id} was created. The firewall was NOT modified."
+                )
+            } else {
+                let artifact_id = payload
+                    .pointer("/artifact/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let pcap = payload
+                    .pointer("/capture/pcap_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                format!(
+                    "Live capture was approved and completed. PCAP artifact {artifact_id} is at {pcap}. Raw packets were not returned; use offline tools on that pcap."
+                )
+            }
         }
         "rejected" => {
             let feedback = payload
@@ -1582,9 +1778,9 @@ fn build_resume_outcome_summary(payload: &Value) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if feedback.is_empty() {
-                String::from("Live capture was rejected by the user. Revise the plan or use offline analysis.")
+                String::from("The action was rejected by the user. Revise the plan or use a different approach.")
             } else {
-                format!("Live capture was rejected by the user. Feedback: {feedback}")
+                format!("The action was rejected by the user. Feedback: {feedback}")
             }
         }
         _ => {
@@ -1592,7 +1788,7 @@ fn build_resume_outcome_summary(payload: &Value) -> String {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
-            format!("The capture could not start: {message}. Fall back to offline analysis.")
+            format!("The action could not be completed: {message}. Fall back to a safer alternative.")
         }
     }
 }
@@ -1645,10 +1841,18 @@ fn restore_pending_permissions(state: &mut CoreState) -> Result<usize, String> {
             .permission_manager
             .restore_pending(stored.request.clone());
 
-        if state.pending_capture.is_none() {
-            let capture = serde_json::from_value::<PendingCapture>(stored.continuation)
-                .map_err(|error| format!("failed to restore permission continuation: {error}"))?;
+        if state.pending_capture.is_none()
+            && let Ok(capture) =
+                serde_json::from_value::<PendingCapture>(stored.continuation.clone())
+        {
             state.pending_capture = Some(capture);
+            continue;
+        }
+        if state.pending_respond.is_none()
+            && let Ok(respond) =
+                serde_json::from_value::<PendingRespond>(stored.continuation.clone())
+        {
+            state.pending_respond = Some(respond);
         }
     }
 
@@ -1859,11 +2063,13 @@ fn request_capture_permission<W: Write>(
                 "mock tcpdump -i {interface} -nn -s 0 -w capture-{interface}.pcap {filter}"
             ),
             reason: reason.to_string(),
+            confirm_phrase: None,
         },
         tool: ToolRef {
             message_id: message_id.to_string(),
             call_id: call_id.clone(),
         },
+        require_typed_confirmation: false,
     };
     let tool_call = ToolCall {
         id: call_id.clone(),
@@ -1972,11 +2178,16 @@ fn handle_permission_reply<W: Write>(
         .get("feedback")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let typed_confirmation = params
+        .get("typed_confirmation")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     let reply = PermissionReply {
         request_id: request_id.to_string(),
         decision,
         feedback,
+        typed_confirmation,
     };
     let persisted_reply = reply.clone();
 
@@ -1987,6 +2198,17 @@ fn handle_permission_reply<W: Write>(
             code: -32602,
             message: format!("pending request not found: {request_id}"),
         })?;
+
+    if outcome.decision == PermissionDecision::Pending {
+        // Typed confirmation failed: the request stays pending; surface the
+        // validation message so the UI can re-prompt.
+        return Err(RpcError {
+            code: -32014,
+            message: outcome.feedback.unwrap_or_else(|| {
+                String::from("Typed confirmation was not accepted; request is still pending.")
+            }),
+        });
+    }
 
     if let Err(message) = state.sqlite_store.resolve_permission(&persisted_reply) {
         state
@@ -2000,7 +2222,51 @@ fn handle_permission_reply<W: Write>(
 
     let _ = emit_permission_replied(writer, &outcome);
 
-    let result = match outcome.decision {
+    let is_approval = matches!(
+        outcome.decision,
+        PermissionDecision::AllowedOnce | PermissionDecision::AllowedAlways
+    );
+    let tool_call_id = outcome.request.tool.call_id.clone();
+    let tool_session_id = outcome.request.session_id.clone();
+    let tool_name = outcome.request.metadata.tool.clone();
+    let result = match outcome.request.permission {
+        PermissionKind::CaptureLive => {
+            handle_capture_permission_outcome(state, writer, outcome)
+        }
+        PermissionKind::ModifyFirewall => {
+            handle_respond_permission_outcome(state, writer, outcome)
+        }
+    };
+
+    if result.is_err() && is_approval {
+        let _ = state
+            .sqlite_store
+            .update_tool_call_status(&tool_call_id, ToolCallStatus::Error);
+        let _ = set_session_run_state(state, &tool_session_id, RunState::Error);
+        let _ = emit_event(
+            writer,
+            "agent.tool.failed",
+            json!({
+                "tool_call": {
+                    "id": tool_call_id,
+                    "session_id": tool_session_id,
+                    "tool_name": tool_name,
+                    "status": ToolCallStatus::Error,
+                },
+                "message": "Approved tool call failed to start."
+            }),
+        );
+    }
+
+    result
+}
+
+fn handle_capture_permission_outcome<W: Write>(
+    state: &mut CoreState,
+    writer: &mut W,
+    outcome: PermissionOutcome,
+) -> Result<Value, RpcError> {
+    match outcome.decision {
         PermissionDecision::AllowedOnce => {
             start_capture_from_pending(state, writer, &outcome.request.id, "approved_once")
         }
@@ -2057,34 +2323,228 @@ fn handle_permission_reply<W: Write>(
             code: -32000,
             message: String::from("Unexpected pending outcome after permission.reply"),
         }),
-    };
+    }
+}
 
-    if result.is_err()
-        && matches!(
-            outcome.decision,
-            PermissionDecision::AllowedOnce | PermissionDecision::AllowedAlways
-        )
-    {
-        let _ = state
+/// Respond (proposal/preview) outcome: approval creates a traceable proposal
+/// artifact (never touching the firewall), rejection feeds the Agent loop.
+fn handle_respond_permission_outcome<W: Write>(
+    state: &mut CoreState,
+    writer: &mut W,
+    outcome: PermissionOutcome,
+) -> Result<Value, RpcError> {
+    match outcome.decision {
+        PermissionDecision::AllowedOnce | PermissionDecision::AllowedAlways => {
+            let pending = state
+                .pending_respond
+                .take()
+                .filter(|pending| pending.request_id == outcome.request.id)
+                .ok_or_else(|| RpcError {
+                    code: -32602,
+                    message: format!("pending respond continuation not found: {}", outcome.request.id),
+                })?;
+            let (artifact, proposal) = build_firewall_proposal_artifact(
+                state,
+                &pending.proposal,
+            )
+            .map_err(|message| RpcError {
+                code: -32015,
+                message,
+            })?;
+            state
+                .sqlite_store
+                .update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Completed)
+                .map_err(|message| RpcError {
+                    code: -32011,
+                    message,
+                })?;
+            set_session_run_state(state, &outcome.request.session_id, RunState::Idle)?;
+
+            let _ = emit_event(
+                writer,
+                "artifact.created",
+                json!({ "artifact": artifact }),
+            );
+            let _ = emit_event(
+                writer,
+                "respond.proposal.created",
+                json!({
+                    "artifact": artifact,
+                    "proposal": proposal,
+                    "finding_id": pending.proposal.finding_id,
+                    "status": "proposed",
+                    "executed": false,
+                }),
+            );
+            let _ = emit_event(
+                writer,
+                "agent.tool.success",
+                json!({
+                    "tool_call": {
+                        "id": outcome.request.tool.call_id,
+                        "session_id": outcome.request.session_id,
+                        "tool_name": outcome.request.metadata.tool,
+                        "status": ToolCallStatus::Completed,
+                    },
+                    "summary": "Firewall rule proposal created for review. NOT executed.",
+                    "artifact": artifact,
+                }),
+            );
+            let _ = state.sqlite_store.save_agent_resume(
+                &outcome.request.session_id,
+                &json!({
+                    "status": "approved",
+                    "request_id": outcome.request.id,
+                    "proposal": proposal,
+                    "artifact": artifact,
+                    "executed": false,
+                }),
+            );
+            Ok(json!({
+                "status": "approved",
+                "request_id": outcome.request.id,
+                "proposal": proposal,
+                "artifact": artifact,
+                "executed": false,
+            }))
+        }
+        PermissionDecision::Rejected => {
+            state.pending_respond = None;
+            state
+                .sqlite_store
+                .update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Aborted)
+                .map_err(|message| RpcError {
+                    code: -32011,
+                    message,
+                })?;
+            set_session_run_state(state, &outcome.request.session_id, RunState::Idle)?;
+            let _ = emit_event(
+                writer,
+                "agent.tool.failed",
+                json!({
+                    "tool_call": {
+                        "id": outcome.request.tool.call_id,
+                        "session_id": outcome.request.session_id,
+                        "tool_name": outcome.request.metadata.tool,
+                        "status": ToolCallStatus::Aborted,
+                    },
+                    "message": "Firewall rule proposal was rejected; nothing was executed.",
+                    "feedback": outcome.feedback,
+                }),
+            );
+            let _ = state.sqlite_store.save_agent_resume(
+                &outcome.request.session_id,
+                &json!({
+                    "status": "rejected",
+                    "request_id": outcome.request.id,
+                    "feedback": outcome.feedback,
+                    "proposal": null,
+                }),
+            );
+            Ok(json!({
+                "status": "rejected",
+                "request_id": outcome.request.id,
+                "feedback": outcome.feedback,
+            }))
+        }
+        PermissionDecision::Pending => Err(RpcError {
+            code: -32000,
+            message: String::from("Unexpected pending outcome after permission.reply"),
+        }),
+    }
+}
+
+/// Build a traceable firewall-rule proposal artifact. The proposal references
+/// the finding and its evidence; no firewall change is executed or staged.
+fn build_firewall_proposal_artifact(
+    state: &mut CoreState,
+    proposal: &FirewallRuleProposal,
+) -> Result<(ArtifactRef, Value), String> {
+    let mut evidence_lines = Vec::new();
+    let mut finding_title = String::from("(no finding linked)");
+    let mut finding_ref = String::from("(none)");
+    if let Some(finding_id) = &proposal.finding_id {
+        finding_ref = finding_id.clone();
+        if let Some(finding) = state
             .sqlite_store
-            .update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Error);
-        let _ = set_session_run_state(state, &outcome.request.session_id, RunState::Error);
-        let _ = emit_event(
-            writer,
-            "agent.tool.failed",
-            json!({
-                "tool_call": {
-                    "id": outcome.request.tool.call_id,
-                    "session_id": outcome.request.session_id,
-                    "tool_name": outcome.request.metadata.tool,
-                    "status": ToolCallStatus::Error,
-                },
-                "message": "Approved tool call failed to start."
-            }),
-        );
+            .load_finding_by_id(finding_id)
+            .map_err(|message| format!("failed to load finding: {message}"))?
+        {
+            finding_title = finding.title.clone();
+            for evidence in finding.evidence {
+                evidence_lines.push(format!(
+                    "- {} / {} / {}",
+                    evidence.evidence_type, evidence.id, evidence.summary
+                ));
+            }
+        }
+    }
+    for flow in state
+        .sqlite_store
+        .list_flows()
+        .map_err(|message| format!("failed to list flows: {message}"))?
+        .into_iter()
+        .filter(|flow| flow.src_ip == proposal.target || flow.dst_ip == proposal.target)
+        .take(5)
+    {
+        evidence_lines.push(format!(
+            "- flow / {} / {}:{} -> {}:{} {}",
+            flow.id, flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port, flow.protocol
+        ));
     }
 
-    result
+    let target = &proposal.target;
+    let port = proposal
+        .port
+        .map(|port| port.to_string())
+        .unwrap_or_else(|| "any".to_string());
+    let protocol = proposal.protocol.clone().unwrap_or_else(|| "any".to_string());
+    let content = format!(
+        "# Firewall Rule Proposal (preview only)\n\n\
+         - Status: proposed (NOT executed)\n\
+         - Action: {action}\n\
+         - Target: {target}\n\
+         - Port: {port}\n\
+         - Protocol: {protocol}\n\
+         - Finding: {finding_title}\n\
+         - Finding id: {finding_ref}\n\
+         - Reason: {reason}\n\n\
+         ## Evidence refs\n{evidence}\n\n\
+         ## Review checklist\n\
+         - [ ] Confirm the target belongs to the suspicious entity\n\
+         - [ ] Confirm the rule scope (port/protocol) matches the evidence\n\
+         - [ ] Approve execution through a separate high-risk gate\n",
+        action = proposal.action,
+        reason = proposal.reason,
+        evidence = if evidence_lines.is_empty() {
+            "- no matching stored evidence".to_string()
+        } else {
+            evidence_lines.join("\n")
+        },
+    );
+    let artifact = state
+        .artifact_store
+        .write_text_artifact(
+            "firewall-proposal",
+            "md",
+            ArtifactKind::Proposal,
+            "Firewall rule proposal (preview only)",
+            &content,
+        )
+        .map_err(|message| format!("failed to write proposal artifact: {message}"))?;
+
+    let value = json!({
+        "action": proposal.action,
+        "target": proposal.target,
+        "port": port,
+        "protocol": protocol,
+        "finding_id": proposal.finding_id,
+        "finding_title": finding_title,
+        "reason": proposal.reason,
+        "status": "proposed",
+        "executed": false,
+    });
+    Ok((artifact, value))
 }
 
 fn handle_capture_status(state: &mut CoreState) -> Result<Value, RpcError> {
@@ -3049,6 +3509,7 @@ mod tests {
             sqlite_store: SqliteStore::open(db_path).expect("open sqlite store"),
             capture_job: None,
             pending_capture: None,
+            pending_respond: None,
             permission_counter: 0,
             capture_counter: 0,
             tool_counter: 0,
@@ -3426,7 +3887,7 @@ mod tests {
             .as_str()
             .expect("session id")
             .to_string();
-        assert_eq!(first["phase"], "phase12");
+        assert_eq!(first["phase"], "phase13");
         assert_eq!(first["session_created"], true);
         assert_eq!(first["llm"]["used"], false);
         assert!(
@@ -3516,7 +3977,7 @@ mod tests {
             json!({ "input": "List stored flows and findings." }),
         );
         let tool_calls = turn["tool_calls"].as_array().expect("tool calls");
-        assert_eq!(turn["phase"], "phase12");
+        assert_eq!(turn["phase"], "phase13");
         assert_eq!(turn["resumed"], false);
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(tool_calls[0]["tool_name"], "flow.list");
@@ -3869,7 +4330,7 @@ mod tests {
             json!({ "input": "请抓包看看当前网络是否有异常流量" }),
         );
 
-        assert_eq!(result["phase"], "phase12");
+        assert_eq!(result["phase"], "phase13");
         assert_eq!(result["run_state"], "waiting_permission");
         assert_eq!(result["capture_proposal"]["status"], "waiting_permission");
         assert_eq!(result["capture_proposal"]["capture"]["duration"], 10);
@@ -4130,5 +4591,152 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(pcap_path);
+    }
+
+    #[test]
+    fn firewall_proposal_requires_typed_confirmation_and_stays_traceable() {
+        if !tshark_available() {
+            return;
+        }
+
+        let db_path = temp_db_path("phase13-firewall-proposal");
+        let pcap_path = temp_pcap_path("phase13-firewall-proposal");
+        write_test_dns_pcap(&pcap_path);
+        let pcap_path_str = pcap_path.to_str().expect("pcap path").to_string();
+        let mut state = test_core_state(&db_path);
+
+        // Build evidence: offline analysis creates the NXDOMAIN finding.
+        let (evidence, _) = call_rpc(
+            &mut state,
+            1,
+            "agent.ask",
+            json!({ "input": format!("请分析本地 pcap 文件 {pcap_path_str} 中的 DNS 异常") }),
+        );
+        let (findings, _) = call_rpc(&mut state, 2, "finding.list", json!({}));
+        assert_eq!(findings["total"], 1);
+        let finding_id = findings["findings"][0]["id"]
+            .as_str()
+            .expect("finding id")
+            .to_string();
+
+        // Agent proposes a firewall rule for the finding's entity.
+        let (proposal, events) = call_rpc(
+            &mut state,
+            3,
+            "agent.ask",
+            json!({ "input": format!("请对 {finding_id} 的实体 10.0.0.8 提出防火墙封禁建议") }),
+        );
+        assert_eq!(proposal["run_state"], "waiting_permission");
+        assert_eq!(proposal["capture_proposal"]["require_typed_confirmation"], true);
+        let session_id = proposal["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let request_id = proposal["permission_request_id"]
+            .as_str()
+            .expect("request id")
+            .to_string();
+        assert_ne!(session_id, evidence["session"]["id"].as_str().unwrap());
+        assert!(
+            events
+                .iter()
+                .any(|event| event["method"] == "permission.asked")
+        );
+        let (pending, _) = call_rpc(&mut state, 4, "permission.list_pending", json!({}));
+        assert_eq!(pending["pending"].as_array().unwrap().len(), 1);
+        assert_eq!(pending["pending"][0]["permission"], "modify_firewall");
+        assert_eq!(pending["pending"][0]["risk"], "high");
+        assert_eq!(pending["pending"][0]["require_typed_confirmation"], true);
+        assert_eq!(
+            pending["pending"][0]["metadata"]["confirm_phrase"],
+            "BLOCK 10.0.0.8"
+        );
+        assert!(
+            pending["pending"][0]["metadata"]["command_preview"]
+                .as_str()
+                .unwrap()
+                .contains("PREVIEW ONLY")
+        );
+
+        // Missing typed confirmation is rejected and the request stays pending.
+        let (bad_reply, _) = call_rpc_raw(
+            &mut state,
+            5,
+            "permission.reply",
+            json!({ "request_id": request_id, "decision": "once" }),
+        );
+        assert_eq!(bad_reply.error.expect("error").code, -32014);
+        let (still_pending, _) = call_rpc(&mut state, 6, "permission.list_pending", json!({}));
+        assert_eq!(still_pending["pending"].as_array().unwrap().len(), 1);
+
+        // Wrong phrase is also rejected.
+        let (wrong_reply, _) = call_rpc_raw(
+            &mut state,
+            7,
+            "permission.reply",
+            json!({
+                "request_id": request_id,
+                "decision": "once",
+                "typed_confirmation": "BLOCK 1.1.1.1"
+            }),
+        );
+        assert_eq!(wrong_reply.error.expect("error").code, -32014);
+
+        // Correct phrase approves; a proposal artifact is created, never executed.
+        let (approved, approve_events) = call_rpc(
+            &mut state,
+            8,
+            "permission.reply",
+            json!({
+                "request_id": request_id,
+                "decision": "once",
+                "typed_confirmation": "BLOCK 10.0.0.8"
+            }),
+        );
+        assert_eq!(approved["status"], "approved");
+        assert_eq!(approved["executed"], false);
+        assert_eq!(approved["proposal"]["target"], "10.0.0.8");
+        assert!(
+            approve_events
+                .iter()
+                .any(|event| event["method"] == "respond.proposal.created")
+        );
+        assert!(
+            approve_events
+                .iter()
+                .any(|event| event["method"] == "artifact.created")
+        );
+
+        let proposal_path = approved["artifact"]["path"].as_str().expect("proposal path");
+        let proposal_content = std::fs::read_to_string(proposal_path).expect("read proposal");
+        assert!(proposal_content.contains("NOT executed"));
+        assert!(proposal_content.contains("10.0.0.8"));
+        assert!(proposal_content.contains(finding_id.as_str()));
+        assert!(proposal_content.contains("evidence"));
+
+        // Resume: the agent finalizes with the proposal reference.
+        let (resumed, _) = call_rpc(
+            &mut state,
+            9,
+            "agent.resume",
+            json!({ "session_id": session_id }),
+        );        assert_eq!(resumed["run_state"], "idle");
+        assert_eq!(
+            resumed["tool_calls"].as_array().unwrap()[0]["tool_name"],
+            "respond.propose_firewall_rule"
+        );
+        assert_eq!(
+            resumed["tool_calls"].as_array().unwrap()[0]["status"],
+            "completed"
+        );
+
+        // Nothing was executed against the system: no pfctl subprocess exists
+        // in this test path and the proposal is the only record.
+        assert!(state.capture_job.is_none());
+        assert!(state.pending_respond.is_none());
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(pcap_path);
+        let _ = std::fs::remove_file(proposal_path);
     }
 }

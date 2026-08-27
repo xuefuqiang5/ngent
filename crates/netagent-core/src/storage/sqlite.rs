@@ -459,6 +459,11 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn load_finding_by_id(&self, id: &str) -> Result<Option<Finding>, String> {
+        let findings = self.list_findings()?;
+        Ok(findings.into_iter().find(|finding| finding.id == id))
+    }
+
     pub fn list_findings(&self) -> Result<Vec<Finding>, String> {
         let mut stmt = self
             .conn

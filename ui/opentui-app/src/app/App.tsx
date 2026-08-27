@@ -36,6 +36,8 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
   const renderer = useRenderer()
   const [state, setState] = useState<AppState>(initialState())
   const viewMode = deriveViewMode(state)
+  const [confirmInput, setConfirmInput] = useState("")
+  const [confirmError, setConfirmError] = useState<string | undefined>(undefined)
   const sessionIdRef = useRef<string | undefined>(undefined)
   const resumeInFlightRef = useRef(false)
   sessionIdRef.current = state.session.sessionId
@@ -96,6 +98,28 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
     }
 
     if (state.permission.pending.length > 0) {
+      const request = state.permission.pending[0]
+      if (request.require_typed_confirmation) {
+        if (event.name === "return") {
+          const phrase = confirmInput.trim()
+          if (phrase.length > 0) void replyToPermission("once", phrase)
+          return
+        }
+        if (event.name === "escape") {
+          setConfirmInput("")
+          return
+        }
+        if (event.name === "n") {
+          void replyToPermission("reject")
+          return
+        }
+        if (event.name === "f") {
+          void replyToPermission("reject_with_feedback")
+          return
+        }
+        setConfirmInput((current) => applyChatInputKey(current, event))
+        return
+      }
       if (event.name === "y") {
         void replyToPermission("once")
         return
@@ -299,6 +323,7 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
 
   async function replyToPermission(
     decision: "once" | "always" | "reject" | "reject_with_feedback",
+    typedConfirmation?: string,
   ): Promise<void> {
     const request = state.permission.pending[0]
     if (!request || state.permission.replying) return
@@ -319,8 +344,12 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
           decision === "reject_with_feedback"
             ? "Use a shorter duration and limit to dns."
             : undefined,
+        typed_confirmation:
+          typedConfirmation !== undefined ? typedConfirmation : undefined,
       })
 
+      setConfirmInput("")
+      setConfirmError(undefined)
       const pending = await rpc.request("permission.list_pending")
       setState((current: AppState) => ({
         ...current,
@@ -330,6 +359,10 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
       }))
       await refreshCaptureStatus()
       await tryResumeSession()
+    } catch (error) {
+      if (request.require_typed_confirmation) {
+        setConfirmError(error instanceof Error ? error.message : String(error))
+      }
     } finally {
       setState((current: AppState) => ({
         ...current,
@@ -393,7 +426,11 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
 
           <AgentCapabilityStrip snapshot={state.dashboard} />
 
-          <InlinePermissionCard request={state.permission.pending[0]} />
+          <InlinePermissionCard
+            request={state.permission.pending[0]}
+            confirmInput={confirmInput}
+            confirmError={confirmError}
+          />
 
           <FindingsStrip findings={findings} totalCount={state.alerts.length} />
 
@@ -742,8 +779,13 @@ function Composer(props: { state: AppState }) {
   )
 }
 
-function InlinePermissionCard(props: { request?: PendingApproval }) {
-  if (!props.request) return null
+function InlinePermissionCard(props: {
+  request?: PendingApproval
+  confirmInput?: string
+  confirmError?: string
+}) {
+  const request = props.request
+  if (!request) return null
 
   return (
     <box
@@ -756,19 +798,36 @@ function InlinePermissionCard(props: { request?: PendingApproval }) {
       gap={1}
     >
       <text fg="#f59e0b">
-        {`permission required · ${props.request.risk} risk`}
+        {`permission required · ${request.risk} risk${request.require_typed_confirmation ? " · typed confirmation" : ""}`}
       </text>
-      <text fg="#e5e7eb">{props.request.metadata.tool}</text>
-      <text fg="#cbd5e1">{truncate(props.request.metadata.reason, 180)}</text>
-      {props.request.patterns.length > 0 ? (
+      <text fg="#e5e7eb">{request.metadata.tool}</text>
+      <text fg="#cbd5e1">{truncate(request.metadata.reason, 180)}</text>
+      {request.patterns.length > 0 ? (
         <text fg="#94a3b8">
-          {`scope: ${truncate(props.request.patterns.join(" "), 160)}`}
+          {`scope: ${truncate(request.patterns.join(" "), 160)}`}
         </text>
       ) : null}
       <text fg="#94a3b8">
-        {`preview: ${truncate(props.request.metadata.command_preview, 180)}`}
+        {`preview: ${truncate(request.metadata.command_preview, 180)}`}
       </text>
-      <text fg="#d97706">[Y] once   [A] always   [N] reject   [F] feedback</text>
+      {request.require_typed_confirmation ? (
+        <box flexDirection="column" gap={1}>
+          <text fg="#f97316">
+            {`type confirmation phrase: ${request.metadata.confirm_phrase ?? "(not configured)"}`}
+          </text>
+          <text fg="#f8fafc">
+            {`> ${props.confirmInput ?? ""}${props.confirmInput?.length ? "▌" : ""}`}
+          </text>
+          {props.confirmError ? (
+            <text fg="#f87171">{`confirmation rejected: ${truncate(props.confirmError, 140)}`}</text>
+          ) : null}
+          <text fg="#d97706">
+            [Enter] approve (once)   [N] reject   [F] feedback   [Esc] clear
+          </text>
+        </box>
+      ) : (
+        <text fg="#d97706">[Y] once   [A] always   [N] reject   [F] feedback</text>
+      )}
     </box>
   )
 }

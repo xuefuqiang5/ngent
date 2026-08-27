@@ -12,6 +12,7 @@ pub enum RiskLevel {
 #[serde(rename_all = "snake_case")]
 pub enum PermissionKind {
     CaptureLive,
+    ModifyFirewall,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +44,10 @@ pub struct PermissionMetadata {
     pub tool: String,
     pub command_preview: String,
     pub reason: String,
+    /// Phrase the user must type verbatim for high-risk requests that require
+    /// typed confirmation (e.g. firewall changes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_phrase: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +60,11 @@ pub struct PermissionRequest {
     pub risk: RiskLevel,
     pub metadata: PermissionMetadata,
     pub tool: ToolRef,
+    /// When true the UI must collect the typed confirmation phrase before the
+    /// request can be approved; the Core validates it against
+    /// `metadata.confirm_phrase`.
+    #[serde(default)]
+    pub require_typed_confirmation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,4 +72,7 @@ pub struct PermissionReply {
     pub request_id: String,
     pub decision: PermissionReplyKind,
     pub feedback: Option<String>,
+    /// User-typed confirmation phrase for high-risk requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_confirmation: Option<String>,
 }

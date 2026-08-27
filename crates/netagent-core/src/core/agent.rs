@@ -1052,7 +1052,7 @@ impl AgentRuntime {
 
     pub fn build_agent_response(turn: &AgentTurn) -> Value {
         let mut response = json!({
-            "phase": "phase12",
+            "phase": "phase13",
             "session_created": turn.session_created,
             "session": turn.session_finished,
             "step": turn.step,
@@ -1175,6 +1175,24 @@ impl AgentRuntime {
             );
         }
 
+        if Self::wants_respond_action(&lower) {
+            let mut plan = vec![("finding.list", json!({ "limit": 12 }))];
+            if let Some(target) = Self::extract_ip_target(input) {
+                let mut arguments = json!({
+                    "target": target,
+                    "action": "block",
+                    "reason": "User requested a firewall response for this target during the investigation.",
+                });
+                if let Some(finding_id) = Self::extract_finding_id(input) {
+                    arguments["finding_id"] = json!(finding_id);
+                }
+                plan.push(("respond.propose_firewall_rule", arguments));
+            }
+            if plan.len() > 1 {
+                return Self::fallback_plan_from_pairs(step_id, plan);
+            }
+        }
+
         if Self::wants_live_evidence(&lower, input) {
             return Self::fallback_plan_from_pairs(
                 step_id,
@@ -1288,6 +1306,27 @@ impl AgentRuntime {
         let chinese = input
             .chars()
             .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character));
+
+        if let Some(proposal) = outcome.get("proposal") {
+            let target = proposal
+                .get("target")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let artifact = outcome
+                .pointer("/artifact/id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return if chinese {
+                format!(
+                    "防火墙规则提案已创建（preview only，未执行）。\n\n- 目标: {target}（action=block）\n- 状态: proposed，防火墙未被修改\n- 提案与证据引用: artifact {artifact}\n\n此提案仅用于评审；任何实际防火墙修改都需要独立的高风险确认。"
+                )
+            } else {
+                format!(
+                    "Firewall rule proposal created (preview only, not executed).\n\n- Target: {target} (action=block)\n- Status: proposed; the firewall was NOT modified\n- Proposal and evidence refs: artifact {artifact}\n\nThis proposal is for review only; any real firewall change requires a separate high-risk approval."
+                )
+            };
+        }
+
         let heading = if chinese {
             match status {
                 "approved" | "completed" => {
@@ -1368,6 +1407,52 @@ impl AgentRuntime {
             lower,
             &["抓包", "capture", "packet", "live", "实时", "当前网络", "现在网络", "流量", "可疑", "异常"],
         ) || Self::contains_any(input, &["抓包", "实时", "当前网络", "现在网络", "流量", "可疑", "异常"])
+    }
+
+    fn wants_respond_action(lower: &str) -> bool {
+        Self::contains_any(
+            lower,
+            &["firewall", "防火墙", "封禁", "阻断", "block", "响应", "respond"],
+        )
+    }
+
+    fn extract_ip_target(input: &str) -> Option<String> {
+        input
+            .split(|character: char| {
+                !(character.is_ascii_alphanumeric()
+                    || matches!(character, '.' | ':' | '/'))
+            })
+            .find(|token| Self::looks_like_ip_or_cidr(token))
+            .map(str::to_string)
+    }
+
+    fn extract_finding_id(input: &str) -> Option<String> {
+        input
+            .split(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+            })
+            .find(|token| token.starts_with("finding_") && token.len() > "finding_".len())
+            .map(str::to_string)
+    }
+
+    fn looks_like_ip_or_cidr(value: &str) -> bool {
+        if let Some(cidr) = value.split_once('/') {
+            return cidr.1.parse::<u8>().is_ok() && Self::looks_like_ip(cidr.0);
+        }
+        Self::looks_like_ip(value)
+    }
+
+    fn looks_like_ip(value: &str) -> bool {
+        if value.contains(':') {
+            return value
+                .split(':')
+                .all(|part| part.is_empty() || u16::from_str_radix(part, 16).is_ok());
+        }
+        let octets = value.split('.').collect::<Vec<_>>();
+        octets.len() == 4
+            && octets.iter().all(|octet| {
+                octet.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
+            })
     }
 
     fn extract_pcap_path(input: &str) -> Option<String> {
@@ -1452,6 +1537,7 @@ impl AgentRuntime {
             "dns_detect_anomalies" => String::from("dns.detect_anomalies"),
             "report_generate" => String::from("report.generate"),
             "ioc_export" => String::from("ioc.export"),
+            "respond_propose_firewall_rule" => String::from("respond.propose_firewall_rule"),
             other => other.to_string(),
         }
     }

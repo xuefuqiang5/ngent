@@ -1,6 +1,6 @@
 # NetAgent
 
-NetAgent is a permission-aware terminal agent for network investigation. The Phase 12 demo shows a complete investigate loop: the Agent plans, requests a live capture through the Permission State Machine, and when the user rejects with feedback it automatically replans with offline pcap analysis, finds the anomaly, and produces a report and IOC export. Everything — plans, tool calls, results, permission decisions — is persisted in SQLite and survives Core/TUI restarts.
+NetAgent is a permission-aware terminal agent for network investigation. The demo shows a complete investigate loop: the Agent plans, requests a live capture through the Permission State Machine, replans with offline pcap analysis when rejected with feedback, finds anomalies, and can propose a high-risk firewall response that requires typed confirmation and only ever produces a review artifact. Everything — plans, tool calls, results, permission decisions — is persisted in SQLite and survives Core/TUI restarts.
 
 ## Prerequisites
 
@@ -65,7 +65,7 @@ bun run start
 
 ## Current agent tools
 
-The model/local planner can call 12 typed Phase 12 tools. All are executed by the Rust Tool Runtime with full session/message/part/call context, and every result is a bounded summary plus structured output and `ArtifactRef` values — raw packet or command output never enters the model context:
+The model/local planner can call 13 typed Phase 13 tools. All are executed by the Rust Tool Runtime with full session/message/part/call context, and every result is a bounded summary plus structured output and `ArtifactRef` values — raw packet or command output never enters the model context:
 
 - `flow.list` / `finding.list` — list up to 25 stored flows/findings.
 - `capture.status` — inspect capture state without starting or stopping capture.
@@ -74,6 +74,7 @@ The model/local planner can call 12 typed Phase 12 tools. All are executed by th
 - `pcap.open` / `tshark.extract_flows` / `tshark.extract_dns` — parse and persist offline pcap evidence.
 - `dns.detect_anomalies` — NXDOMAIN spike rule over stored DNS events; creates `finding.created`.
 - `report.generate` / `ioc.export` — Markdown evidence report and IOC JSON document artifacts.
+- `respond.propose_firewall_rule` — high-risk proposal/preview only. The Agent pauses, the user must type an exact confirmation phrase (e.g. `BLOCK 10.0.0.8`) in the TUI, and approval creates a traceable proposal artifact (finding id + evidence refs, `executed=false`). The firewall is NEVER modified.
 
 The Core also exposes session recovery, capture RPCs, and a bounded mock-output RPC; inspect the exact RPC/event list with `core.capabilities`.
 
@@ -95,9 +96,11 @@ For deterministic Core-only demos that require no API key and no live-capture pr
 ./scripts/demo_phase11.sh   # read-only tool loop + restart recovery
 ./scripts/demo_phase12.sh   # discover -> plan -> capture permission -> reject-with-feedback
                             # -> offline pcap analysis -> finding/report/IOC -> recovery
+./scripts/demo_phase13.sh   # offline evidence -> high-risk firewall rule proposal with
+                            # typed confirmation -> traceable proposal (never executed)
 ```
 
-`demo_phase12.sh` generates its own DNS NXDOMAIN fixture pcap (via `cargo run --example gen_fixture`) inside an isolated temporary database/artifact directory.
+The demo scripts generate their own DNS NXDOMAIN fixture pcap (via `cargo run --example gen_fixture`) inside an isolated temporary database/artifact directory.
 
 ## Useful startup checks
 

@@ -28,6 +28,18 @@ impl PermissionManager {
     }
 
     pub fn reply(&mut self, reply: PermissionReply) -> Option<PermissionOutcome> {
+        let request = self.pending.get(&reply.request_id)?.clone();
+
+        if request.require_typed_confirmation {
+            if let Err(message) = Self::validate_typed_confirmation(&request, &reply) {
+                return Some(PermissionOutcome {
+                    request,
+                    decision: PermissionDecision::Pending,
+                    feedback: Some(message),
+                });
+            }
+        }
+
         let request = self.pending.remove(&reply.request_id)?;
         let decision = match reply.decision {
             PermissionReplyKind::Once => PermissionDecision::AllowedOnce,
@@ -45,6 +57,36 @@ impl PermissionManager {
             decision,
             feedback: reply.feedback,
         })
+    }
+
+    /// Typed confirmation for high-risk requests: the user must type the exact
+    /// phrase carried in the request metadata (case-insensitive, trimmed).
+    pub fn validate_typed_confirmation(
+        request: &PermissionRequest,
+        reply: &PermissionReply,
+    ) -> Result<(), String> {
+        let phrase = request
+            .metadata
+            .confirm_phrase
+            .as_deref()
+            .unwrap_or_default();
+        let provided = reply
+            .typed_confirmation
+            .as_deref()
+            .unwrap_or_default()
+            .trim();
+        if phrase.is_empty() {
+            return Err(String::from(
+                "This request requires typed confirmation but no phrase is configured.",
+            ));
+        }
+        if provided.eq_ignore_ascii_case(phrase) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Typed confirmation does not match. Type exactly: {phrase}"
+            ))
+        }
     }
 
     pub fn list_pending(&self) -> Vec<PermissionRequest> {
@@ -98,5 +140,6 @@ impl PermissionManager {
 fn permission_slug(permission: PermissionKind) -> &'static str {
     match permission {
         PermissionKind::CaptureLive => "capture_live",
+        PermissionKind::ModifyFirewall => "modify_firewall",
     }
 }

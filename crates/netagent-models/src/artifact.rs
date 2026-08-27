@@ -8,6 +8,7 @@ pub enum ArtifactKind {
     Pcap,
     Report,
     IocExport,
+    Proposal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

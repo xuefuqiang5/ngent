@@ -45,7 +45,7 @@ impl ArtifactStore {
         self.write_text_artifact(stem, "json", ArtifactKind::IocExport, "IOC export", content)
     }
 
-    fn write_text_artifact(
+    pub fn write_text_artifact(
         &mut self,
         stem: &str,
         extension: &str,

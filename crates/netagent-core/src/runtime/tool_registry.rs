@@ -105,10 +105,9 @@ impl ToolRegistry {
         tools
     }
 
-    /// Tools the Agent (LLM or deterministic planner) may call. Phase 12 set:
-    /// five read-only tools, `capture.start` (permission-gated), and bounded
-    /// offline analysis/export tools. `capture.stop` and `mock.large_output`
-    /// are deliberately excluded from the agent allowlist.
+    /// Tools the Agent (LLM or deterministic planner) may call. Phase 13 set:
+    /// Phase 12 tools plus `respond.propose_firewall_rule` (preview only, never
+    /// executes pfctl). `capture.stop` and `mock.large_output` are excluded.
     pub fn agent_defs(&self) -> Vec<ToolDef> {
         let mut tools = self.readonly_defs();
         tools.push(ToolDef {
@@ -124,6 +123,18 @@ impl ToolRegistry {
             truncate_at: 4,
         });
         tools.extend(self.offline_defs());
+        tools.push(ToolDef {
+            id: String::from("respond.propose_firewall_rule"),
+            description: String::from(
+                "Propose a firewall block rule for a target found in stored evidence. This only creates a proposal artifact for review — it NEVER modifies the firewall. High-risk; the user must type an explicit confirmation phrase.",
+            ),
+            input_schema: firewall_rule_schema(),
+            output_schema: standard_output_schema(),
+            permissions: vec![String::from("modify_firewall")],
+            risk: String::from("high"),
+            timeout_ms: Some(5_000),
+            truncate_at: 12,
+        });
         tools
     }
 
@@ -703,6 +714,104 @@ impl ToolRegistry {
         }
     }
 
+    /// Validate typed `respond.propose_firewall_rule` input without executing
+    /// anything. Produces the proposal intent that the permission state
+    /// machine turns into a high-risk typed-confirmation request.
+    pub fn validate_firewall_rule_input(&self, input: &Value) -> Result<FirewallRuleProposal, String> {
+        let object = validate_object_input(input)?;
+        reject_unknown_fields(
+            object,
+            &["finding_id", "target", "port", "protocol", "action", "reason"],
+        )?;
+        let target = object
+            .get("target")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| String::from("target must be a non-empty IP address or CIDR"))?
+            .trim()
+            .to_string();
+        if !Self::looks_like_ip_or_cidr(&target) {
+            return Err(format!(
+                "target must be an IPv4/IPv6 address or CIDR, got: {target}"
+            ));
+        }
+        let action = object
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("block")
+            .trim()
+            .to_string();
+        if action != "block" {
+            return Err(format!(
+                "only action=block is supported in preview mode, got: {action}"
+            ));
+        }
+        let port = object
+            .get("port")
+            .and_then(Value::as_u64)
+            .map(|port| {
+                if port == 0 || port > 65535 {
+                    Err(String::from("port must be between 1 and 65535"))
+                } else {
+                    Ok(port as u16)
+                }
+            })
+            .transpose()?;
+        let protocol = object
+            .get("protocol")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty());
+        let reason = object
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| String::from("reason must be a non-empty string describing the evidence"))?
+            .trim()
+            .to_string();
+        let finding_id = object
+            .get("finding_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty());
+
+        Ok(FirewallRuleProposal {
+            finding_id,
+            target,
+            port,
+            protocol,
+            action,
+            reason,
+        })
+    }
+
+    fn looks_like_ip_or_cidr(value: &str) -> bool {
+        if let Some(cidr) = value.split_once('/') {
+            let network = cidr.0;
+            let prefix = cidr.1;
+            let Ok(prefix) = prefix.parse::<u8>() else {
+                return false;
+            };
+            let max_prefix = if network.contains(':') { 128 } else { 32 };
+            return prefix <= max_prefix && Self::looks_like_ip(network);
+        }
+        Self::looks_like_ip(value)
+    }
+
+    fn looks_like_ip(value: &str) -> bool {
+        if value.contains(':') {
+            return value
+                .split(':')
+                .all(|part| part.is_empty() || u16::from_str_radix(part, 16).is_ok());
+        }
+        let octets = value.split('.').collect::<Vec<_>>();
+        octets.len() == 4
+            && octets.iter().all(|octet| {
+                octet.parse::<u8>().is_ok()
+                    || octet.parse::<u16>().map(|n| n <= 255).unwrap_or(false)
+            })
+    }
+
     pub fn run_mock_large_output(
         &self,
         context: &ToolContext,
@@ -791,6 +900,16 @@ pub struct CapturePlanIntent {
     pub interface: String,
     pub filter: String,
     pub duration: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirewallRuleProposal {
+    pub finding_id: Option<String>,
+    pub target: String,
+    pub port: Option<u16>,
+    pub protocol: Option<String>,
+    pub action: String,
     pub reason: String,
 }
 
@@ -960,6 +1079,43 @@ fn pcap_path_schema() -> Value {
     )
 }
 
+fn firewall_rule_schema() -> Value {
+    object_schema(
+        json!({
+            "finding_id": {
+                "type": "string",
+                "description": "Optional finding id this rule responds to, for traceability"
+            },
+            "target": {
+                "type": "string",
+                "minLength": 1,
+                "description": "IPv4/IPv6 address or CIDR to block"
+            },
+            "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535,
+                "description": "Optional destination port"
+            },
+            "protocol": {
+                "type": "string",
+                "description": "Optional protocol, e.g. tcp or udp"
+            },
+            "action": {
+                "type": "string",
+                "enum": ["block"],
+                "description": "Action; only block is supported in preview mode"
+            },
+            "reason": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Evidence-based justification for the rule"
+            }
+        }),
+        &["target", "action", "reason"],
+    )
+}
+
 fn standard_output_schema() -> Value {
     json!({
         "type": "object",
@@ -988,7 +1144,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openai_schemas_expose_phase12_agent_tools_but_not_capture_stop_or_mock() {
+    fn openai_schemas_expose_phase13_agent_tools_but_not_capture_stop_or_mock() {
         let registry = ToolRegistry;
         let schemas = registry.openai_tool_schemas();
         let names = schemas
@@ -996,7 +1152,7 @@ mod tests {
             .filter_map(|schema| schema.pointer("/function/name").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 13);
         assert!(names.contains(&"flow_list"));
         assert!(names.contains(&"artifact_summary"));
         assert!(names.contains(&"capture_start"));
@@ -1004,9 +1160,56 @@ mod tests {
         assert!(names.contains(&"dns_detect_anomalies"));
         assert!(names.contains(&"report_generate"));
         assert!(names.contains(&"ioc_export"));
+        assert!(names.contains(&"respond_propose_firewall_rule"));
         assert!(!names.contains(&"capture_stop"));
         assert!(!names.contains(&"mock_large_output"));
         assert!(names.iter().all(|name| !name.contains('.')));
+    }
+
+    #[test]
+    fn firewall_rule_def_declares_high_risk_modify_firewall_permission() {
+        let registry = ToolRegistry;
+        let rule = registry
+            .agent_defs()
+            .into_iter()
+            .find(|tool| tool.id == "respond.propose_firewall_rule")
+            .expect("firewall rule def");
+        assert_eq!(rule.permissions, vec!["modify_firewall"]);
+        assert_eq!(rule.risk, "high");
+    }
+
+    #[test]
+    fn firewall_rule_input_validation_rejects_bad_targets_and_actions() {
+        let registry = ToolRegistry;
+        let valid = registry
+            .validate_firewall_rule_input(&json!({
+                "finding_id": "finding_0001",
+                "target": "10.0.0.8",
+                "port": 53,
+                "protocol": "udp",
+                "action": "block",
+                "reason": "NXDOMAIN spike evidence points to this host.",
+            }))
+            .expect("valid rule");
+        assert_eq!(valid.target, "10.0.0.8");
+        assert_eq!(valid.port, Some(53));
+        assert_eq!(valid.action, "block");
+
+        assert!(registry
+            .validate_firewall_rule_input(&json!({ "target": "10.0.0.8", "action": "drop", "reason": "x" }))
+            .is_err());
+        assert!(registry
+            .validate_firewall_rule_input(&json!({ "target": "not-an-ip", "action": "block", "reason": "x" }))
+            .is_err());
+        assert!(registry
+            .validate_firewall_rule_input(&json!({ "target": "10.0.0.8/99", "action": "block", "reason": "x" }))
+            .is_err());
+        assert!(registry
+            .validate_firewall_rule_input(&json!({ "target": "10.0.0.8", "action": "block", "reason": "" }))
+            .is_err());
+        assert!(registry
+            .validate_firewall_rule_input(&json!({ "target": "10.0.0.8", "action": "block", "reason": "x", "shell": "rm -rf /" }))
+            .is_err());
     }
 
     #[test]

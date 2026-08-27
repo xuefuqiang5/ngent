@@ -248,6 +248,7 @@ impl ArtifactLabelExt for ArtifactRef {
             ArtifactKind::Pcap => "pcap",
             ArtifactKind::Report => "report",
             ArtifactKind::IocExport => "ioc_export",
+            ArtifactKind::Proposal => "proposal",
         }
     }
 }
