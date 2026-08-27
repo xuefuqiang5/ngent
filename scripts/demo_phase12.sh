@@ -76,16 +76,15 @@ session_id="$(printf '%s\n' "$phase1_out" | jq -r 'select(.id == 2) | .result.se
 
 echo
 echo "--- Step 2: user rejects live capture with feedback; agent must replan"
-phase2_out="$(printf '%s\n%s\n%s\n' \
+phase2_out="$(printf '%s\n%s\n' \
   "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"permission.reply\",\"params\":{\"request_id\":\"$request_id\",\"decision\":\"reject_with_feedback\",\"feedback\":\"不要实时抓包，请分析本地 pcap 文件 $fixture_pcap\"}}" \
-  "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"agent.resume\",\"params\":{\"session_id\":\"$session_id\"}}" \
-  "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"session.get\",\"params\":{\"session_id\":\"$session_id\"}}" |
+  "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"agent.resume\",\"params\":{\"session_id\":\"$session_id\"}}" |
   cargo run -q -p netagent-core 2>/dev/null)"
 printf '%s\n' "$phase2_out" | format_demo_output
 
 echo
 echo "--- Step 3: restart recovery - the full investigation survives a Core restart"
-printf '{"jsonrpc":"2.0","id":6,"method":"session.get","params":{"session_id":"%s"}}\n' "$session_id" |
+printf '{"jsonrpc":"2.0","id":5,"method":"session.get","params":{"session_id":"%s"}}\n' "$session_id" |
   cargo run -q -p netagent-core 2>/dev/null | format_demo_output
 
 echo

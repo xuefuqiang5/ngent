@@ -74,23 +74,72 @@ struct RpcError {
 
 #[derive(Debug)]
 struct CoreState {
-    agent_runtime: AgentRuntime,
-    permission_manager: PermissionManager,
+    agent_runtime: std::sync::Arc<std::sync::Mutex<AgentRuntime>>,
+    permission_manager: std::sync::Arc<std::sync::Mutex<PermissionManager>>,
     tool_registry: ToolRegistry,
-    artifact_store: ArtifactStore,
-    sqlite_store: SqliteStore,
+    artifact_store: std::sync::Arc<std::sync::Mutex<ArtifactStore>>,
+    sqlite_store: std::sync::Arc<std::sync::Mutex<SqliteStore>>,
     rule_manifests: Vec<RuleManifest>,
-    capture_job: Option<CaptureJob>,
-    pending_capture: Option<PendingCapture>,
-    pending_respond: Option<PendingRespond>,
+    capture_job: std::sync::Arc<std::sync::Mutex<Option<CaptureJob>>>,
+    pending_capture: std::sync::Arc<std::sync::Mutex<Option<PendingCapture>>>,
+    pending_respond: std::sync::Arc<std::sync::Mutex<Option<PendingRespond>>>,
     agent_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Abort signals forwarded by the stdin reader thread while a streaming
-    /// agent turn is running. Polled inside the streaming delta callback.
-    agent_abort_rx: Option<std::sync::mpsc::Receiver<()>>,
-    permission_counter: u64,
-    capture_counter: u64,
-    tool_counter: u64,
-    finding_counter: u64,
+    /// agent turn is running. Polled inside the streaming delta callback of
+    /// whichever thread runs the turn (main thread in tests, worker otherwise).
+    agent_abort_rx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    /// Set while an agent turn runs in its worker thread; rejects concurrent
+    /// agent.ask/agent.resume requests.
+    agent_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    counters: std::sync::Arc<std::sync::Mutex<CoreCounters>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CoreCounters {
+    permission: u64,
+    capture: u64,
+    tool: u64,
+    finding: u64,
+}
+
+impl CoreState {
+    fn permission(&self) -> std::sync::MutexGuard<'_, PermissionManager> {
+        self.permission_manager.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn artifacts(&self) -> std::sync::MutexGuard<'_, ArtifactStore> {
+        self.artifact_store.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn store(&self) -> std::sync::MutexGuard<'_, SqliteStore> {
+        self.sqlite_store.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn capture(&self) -> std::sync::MutexGuard<'_, Option<CaptureJob>> {
+        self.capture_job.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn pending_capture(&self) -> std::sync::MutexGuard<'_, Option<PendingCapture>> {
+        self.pending_capture.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn pending_respond(&self) -> std::sync::MutexGuard<'_, Option<PendingRespond>> {
+        self.pending_respond.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn counters(&self) -> std::sync::MutexGuard<'_, CoreCounters> {
+        self.counters.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn mark_busy(&self) -> bool {
+        !self
+            .agent_busy
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn mark_idle(&self) {
+        self.agent_busy.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,21 +218,21 @@ fn run() -> io::Result<()> {
     let sqlite_store = SqliteStore::open(&db_path).map_err(io::Error::other)?;
 
     let mut state = CoreState {
-        agent_runtime: AgentRuntime::from_env(),
-        permission_manager: PermissionManager::default(),
+        agent_runtime: std::sync::Arc::new(std::sync::Mutex::new(AgentRuntime::from_env())),
+        permission_manager: std::sync::Arc::new(std::sync::Mutex::new(
+            PermissionManager::default(),
+        )),
         tool_registry: ToolRegistry,
-        artifact_store: ArtifactStore::default(),
-        sqlite_store,
+        artifact_store: std::sync::Arc::new(std::sync::Mutex::new(ArtifactStore::default())),
+        sqlite_store: std::sync::Arc::new(std::sync::Mutex::new(sqlite_store)),
         rule_manifests: Vec::new(),
-        capture_job: None,
-        pending_capture: None,
-        pending_respond: None,
+        capture_job: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        pending_capture: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        pending_respond: std::sync::Arc::new(std::sync::Mutex::new(None)),
         agent_abort: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        agent_abort_rx: None,
-        permission_counter: 0,
-        capture_counter: 0,
-        tool_counter: 0,
-        finding_counter: 0,
+        agent_abort_rx: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        agent_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        counters: std::sync::Arc::new(std::sync::Mutex::new(CoreCounters::default())),
     };
     match load_rule_manifests() {
         Ok(manifests) => state.rule_manifests = manifests,
@@ -198,7 +247,7 @@ fn run() -> io::Result<()> {
         return Err(io::Error::other(error));
     }
 
-    match state.sqlite_store.reconcile_interrupted_runtime() {
+    match state.store().reconcile_interrupted_runtime() {
         Ok(summary) => {
             if summary.aborted_steps > 0
                 || summary.aborted_tool_calls > 0
@@ -256,7 +305,7 @@ fn run() -> io::Result<()> {
     let mut writer = SharedStdout(stdout.clone());
     let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
     let (abort_tx, abort_rx) = std::sync::mpsc::channel::<()>();
-    state.agent_abort_rx = Some(abort_rx);
+    *state.agent_abort_rx.lock().unwrap() = Some(abort_rx);
 
     let stdin_stdout = stdout.clone();
     let stdin_thread = std::thread::spawn(move || {
@@ -304,40 +353,152 @@ fn run() -> io::Result<()> {
             jsonrpc: JSON_RPC_VERSION,
             method: "event.core.ready",
             params: json!({
-                "phase": "phase15",
+                "phase": "phase16",
                 "protocol_version": JSON_RPC_VERSION,
-                "message": "NetAgent core ready - Phase 15 streaming LLM with mid-turn cancel."
+                "message": "NetAgent core ready - Phase 16 concurrent request handling."
             }),
         },
     )?;
 
-    for line in req_rx {
-        let response = match serde_json::from_str::<RpcRequest>(&line) {
-            Ok(request) => {
+    // Main loop: agent turns run in worker threads so read-only requests
+    // (capture.status, session.get, permission.list_pending, finding.list, ...)
+    // stay responsive while a long streaming turn is in progress. Turn
+    // responses are written by the worker itself; other responses are written
+    // here. JSON-RPC ids keep everything matched on the UI side.
+    loop {
+        match req_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(line) => {
+                let Ok(request) = serde_json::from_str::<RpcRequest>(&line) else {
+                    write_message(
+                        &mut writer,
+                        &RpcResponse {
+                            jsonrpc: JSON_RPC_VERSION,
+                            id: Value::Null,
+                            result: None,
+                            error: Some(RpcError {
+                                code: -32700,
+                                message: String::from("Parse error"),
+                            }),
+                        },
+                    )?;
+                    continue;
+                };
                 reconcile_capture_state(&mut state, &mut writer)?;
-                handle_request(request, &mut state, &mut writer)?
+                if matches!(request.method.as_str(), "agent.ask" | "agent.resume") {
+                    if !spawn_turn_worker(&mut state, writer.clone(), request) {
+                        write_message(
+                            &mut writer,
+                            &RpcResponse {
+                                jsonrpc: JSON_RPC_VERSION,
+                                id: Value::Null,
+                                result: None,
+                                error: Some(RpcError {
+                                    code: -32016,
+                                    message: String::from(
+                                        "Another agent turn is already running; wait for it to finish.",
+                                    ),
+                                }),
+                            },
+                        )?;
+                    }
+                    continue;
+                }
+                let response = handle_request(request, &mut state, &mut writer)?;
+                write_message(&mut writer, &response)?;
+                // Drain any abort signals that arrived while handling the
+                // request so the next agent turn starts with a clean flag.
+                if let Some(abort_rx) = state.agent_abort_rx.lock().unwrap().as_ref() {
+                    while abort_rx.try_recv().is_ok() {}
+                }
             }
-            Err(error) => RpcResponse {
-                jsonrpc: JSON_RPC_VERSION,
-                id: Value::Null,
-                result: None,
-                error: Some(RpcError {
-                    code: -32700,
-                    message: format!("Parse error: {error}"),
-                }),
-            },
-        };
-
-        write_message(&mut writer, &response)?;
-        // Drain any abort signals that arrived while handling the request so
-        // the next agent turn starts with a clean flag.
-        if let Some(abort_rx) = state.agent_abort_rx.as_ref() {
-            while abort_rx.try_recv().is_ok() {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Keep polling; worker threads write their own responses.
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // stdin closed; let any running turn finish before exiting so
+                // piped request batches still see complete worker responses.
+                while state.agent_busy.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                break;
+            }
         }
     }
 
     let _ = stdin_thread.join();
     Ok(())
+}
+
+/// Spawn a worker thread that runs an `agent.ask` / `agent.resume` turn to
+/// completion. The worker owns a CoreState built from the shared Arc fields,
+/// so the main loop can keep serving read-only requests concurrently. Returns
+/// false (and writes nothing) when another turn is already running.
+fn spawn_turn_worker(
+    state: &mut CoreState,
+    writer: SharedStdout,
+    request: RpcRequest,
+) -> bool {
+    if !state.mark_busy() {
+        return false;
+    }
+    let mut worker_state = CoreState {
+        agent_runtime: state.agent_runtime.clone(),
+        permission_manager: state.permission_manager.clone(),
+        tool_registry: ToolRegistry,
+        artifact_store: state.artifact_store.clone(),
+        sqlite_store: state.sqlite_store.clone(),
+        rule_manifests: state.rule_manifests.clone(),
+        capture_job: state.capture_job.clone(),
+        pending_capture: state.pending_capture.clone(),
+        pending_respond: state.pending_respond.clone(),
+        agent_abort: state.agent_abort.clone(),
+        agent_abort_rx: state.agent_abort_rx.clone(),
+        agent_busy: state.agent_busy.clone(),
+        counters: state.counters.clone(),
+    };
+    let busy = state.agent_busy.clone();
+    let abort_rx = state.agent_abort_rx.clone();
+    let request_id = request.id.clone();
+    let thread = std::thread::Builder::new()
+        .name("agent-turn-worker".to_string())
+        .spawn(move || {
+            let mut worker_writer = writer;
+            match handle_request(request, &mut worker_state, &mut worker_writer) {
+                Ok(response) => {
+                    let _ = write_message(&mut worker_writer, &response);
+                }
+                Err(error) => {
+                    let _ = write_message(
+                        &mut worker_writer,
+                        &RpcResponse {
+                            jsonrpc: JSON_RPC_VERSION,
+                            id: request_id,
+                            result: None,
+                            error: Some(RpcError {
+                                code: -32000,
+                                message: format!("agent turn failed: {error}"),
+                            }),
+                        },
+                    );
+                }
+            }
+            busy.store(false, std::sync::atomic::Ordering::Relaxed);
+            // Reset the abort flag and drain signals so the next turn starts clean.
+            worker_state
+                .agent_abort
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Some(rx) = abort_rx.lock().unwrap().as_ref() {
+                while rx.try_recv().is_ok() {}
+            }
+        });
+    match thread {
+        Ok(_) => true,
+        Err(error) => {
+            state.mark_idle();
+            let _ = writeln!(io::stderr(), "failed to spawn agent worker: {error}");
+            false
+        }
+    }
 }
 
 /// A `Write` adapter over a shared stdout so the stdin reader thread and the
@@ -456,7 +617,7 @@ fn handle_request<W: Write>(
                 "report.generated",
                 "respond.proposal.created"
             ],
-            "llm": state.agent_runtime.llm_status(),
+            "llm": state.agent_runtime.lock().unwrap().llm_status(),
             "agent_tools": state.tool_registry.agent_defs(),
             "rules": state.rule_manifests.clone(),
             "persistence": {
@@ -528,7 +689,7 @@ fn handle_request<W: Write>(
                 }
             };
 
-            if let Err(error) = persist_agent_turn(&state.sqlite_store, &turn) {
+            if let Err(error) = persist_agent_turn(&state.store(), &turn) {
                 return Ok(error_response(
                     request.id,
                     RpcError {
@@ -557,7 +718,7 @@ fn handle_request<W: Write>(
                 Ok(id) => id,
                 Err(error) => return Ok(error_response(request.id, error)),
             };
-            if let Some(job) = &state.capture_job {
+            if let Some(job) = &*state.capture() {
                 if job.session_id == session_id {
                     return Ok(RpcResponse {
                         jsonrpc: JSON_RPC_VERSION,
@@ -571,7 +732,7 @@ fn handle_request<W: Write>(
                     });
                 }
             }
-            let payload = match state.sqlite_store.load_agent_resume(session_id) {
+            let payload = match state.store().load_agent_resume(session_id) {
                 Ok(Some(payload)) => payload,
                 Ok(None) => {
                     return Ok(error_response(
@@ -613,7 +774,7 @@ fn handle_request<W: Write>(
             ) {
                 Ok(turn) => turn,
                 Err(message) => {
-                    let _ = state.sqlite_store.delete_agent_resume(session_id);
+                    let _ = state.store().delete_agent_resume(session_id);
                     return Ok(error_response(
                         request.id,
                         RpcError {
@@ -624,9 +785,9 @@ fn handle_request<W: Write>(
                 }
             };
 
-            let _ = state.sqlite_store.delete_agent_resume(session_id);
+            let _ = state.store().delete_agent_resume(session_id);
 
-            if let Err(error) = persist_agent_turn(&state.sqlite_store, &turn) {
+            if let Err(error) = persist_agent_turn(&state.store(), &turn) {
                 return Ok(error_response(
                     request.id,
                     RpcError {
@@ -673,7 +834,7 @@ fn handle_request<W: Write>(
         "capture.status" => handle_capture_status(state),
         "capture.stop" => handle_capture_stop(state, writer),
         "permission.list_pending" => Ok(json!({
-            "pending": state.permission_manager.list_pending()
+            "pending": state.permission().list_pending()
         })),
         "permission.reply" => handle_permission_reply(state, writer, &request.params),
         "tool.mock_large_output" => handle_tool_mock_large_output(state, writer, &request.params),
@@ -1236,7 +1397,7 @@ fn handle_tool_mock_large_output<W: Write>(
         .get("step_id")
         .and_then(Value::as_str)
         .unwrap_or("step_tool_0001");
-    let call_id = next_counter_id("call", &mut state.tool_counter);
+    let call_id = next_counter_id("call", &mut state.counters().tool);
     let mut tool_call = ToolCall {
         id: call_id.clone(),
         session_id: session_id.to_string(),
@@ -1245,9 +1406,7 @@ fn handle_tool_mock_large_output<W: Write>(
         input: json!({ "query": query }).to_string(),
         status: ToolCallStatus::Pending,
     };
-    state
-        .sqlite_store
-        .insert_tool_call(&tool_call)
+    state.store().insert_tool_call(&tool_call)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -1280,9 +1439,7 @@ fn handle_tool_mock_large_output<W: Write>(
     })?;
 
     tool_call.status = ToolCallStatus::Running;
-    state
-        .sqlite_store
-        .insert_tool_call(&tool_call)
+    state.store().insert_tool_call(&tool_call)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -1290,13 +1447,11 @@ fn handle_tool_mock_large_output<W: Write>(
     let (tool_result, progress) =
         match state
             .tool_registry
-            .run_mock_large_output(&context, query, &mut state.artifact_store)
+            .run_mock_large_output(&context, query, &mut state.artifacts())
         {
             Ok(result) => result,
             Err(message) => {
-                let _ = state
-                    .sqlite_store
-                    .update_tool_call_status(&call_id, ToolCallStatus::Error);
+                let _ = state.store().update_tool_call_status(&call_id, ToolCallStatus::Error);
                 let _ = emit_event(
                     writer,
                     "agent.tool.failed",
@@ -1347,9 +1502,7 @@ fn handle_tool_mock_large_output<W: Write>(
     }
 
     tool_call.status = ToolCallStatus::Completed;
-    state
-        .sqlite_store
-        .insert_tool_call(&tool_call)
+    state.store().insert_tool_call(&tool_call)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -1383,19 +1536,15 @@ fn emit_event<W: Write>(writer: &mut W, method: &str, params: Value) -> io::Resu
 }
 
 fn build_agent_context_summary(state: &CoreState) -> String {
-    let flow_count = state.sqlite_store.flow_count().unwrap_or(0);
-    let dns_count = state
-        .sqlite_store
-        .list_dns_events()
+    let flow_count = state.store().flow_count().unwrap_or(0);
+    let dns_count = state.store().list_dns_events()
         .map(|items| items.len())
         .unwrap_or(0);
-    let finding_count = state
-        .sqlite_store
-        .list_findings()
+    let finding_count = state.store().list_findings()
         .map(|items| items.len())
         .unwrap_or(0);
-    let artifact_count = state.artifact_store.list_artifacts().len();
-    let capture_status = match &state.capture_job {
+    let artifact_count = state.artifacts().list_artifacts().len();
+    let capture_status = match &*state.capture() {
         Some(job) => format!(
             "running capture {} on {} with filter {}",
             job.id, job.interface, job.filter
@@ -1409,8 +1558,9 @@ fn build_agent_context_summary(state: &CoreState) -> String {
 }
 
 /// Run one Agent turn (a fresh `agent.ask` or a permission-driven `agent.resume`)
-/// with the Phase 15 typed tool executor and streaming deltas. The artifact
-/// store and counters are taken out of `state` for the duration of the loop and
+/// with the Phase 15 typed tool executor and streaming deltas. The agent
+/// runtime is taken out of the shared lock for the whole turn (the main thread
+/// never needs it), and the artifact store/counters are taken for the loop and
 /// written back after.
 fn run_agent_turn_with<W: Write, F>(
     state: &mut CoreState,
@@ -1428,11 +1578,11 @@ where
         &mut dyn FnMut(&AgentToolExecutionRequest) -> Result<ToolOutcome, String>,
     ) -> Result<AgentTurn, String>,
 {
-    let mut artifact_store = std::mem::take(&mut state.artifact_store);
+    let mut artifact_store = std::mem::take(&mut *state.artifact_store.lock().unwrap());
     let tool_registry = &state.tool_registry;
-    let sqlite_store = &state.sqlite_store;
-    let mut finding_counter = state.finding_counter;
-    let mut tool_id_counter = state.tool_counter;
+    let sqlite_store = state.sqlite_store.clone();
+    let mut finding_counter = state.counters().finding;
+    let mut tool_id_counter = state.counters().tool;
     let mut permission_seq = 0_u64;
     let permission_seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1446,7 +1596,7 @@ where
     let mut executor = |execution: &AgentToolExecutionRequest| {
         run_agent_tool(
             tool_registry,
-            sqlite_store,
+            &sqlite_store,
             &mut artifact_store,
             capture_status,
             &mut finding_counter,
@@ -1457,7 +1607,7 @@ where
         )
     };
     let mut on_text_delta = |delta: &str| {
-        if let Some(abort_rx) = state.agent_abort_rx.as_ref() {
+        if let Some(abort_rx) = state.agent_abort_rx.lock().unwrap().as_ref() {
             while abort_rx.try_recv().is_ok() {
                 abort.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1477,16 +1627,22 @@ where
         );
     };
 
-    let turn = run(
-        &mut state.agent_runtime,
+    // The runtime lock is held only for the turn call; the main thread never
+    // touches agent_runtime concurrently (capabilities reads LLM config via a
+    // short lock and is only called at UI startup).
+    let mut runtime = std::mem::take(&mut *state.agent_runtime.lock().unwrap());
+    let turn_result = run(
+        &mut runtime,
         tool_schemas,
         &abort,
         &mut on_text_delta,
         &mut executor,
-    )?;
-    state.artifact_store = artifact_store;
-    state.finding_counter = finding_counter;
-    state.tool_counter = tool_id_counter;
+    );
+    *state.agent_runtime.lock().unwrap() = runtime;
+    let turn = turn_result?;
+    *state.artifact_store.lock().unwrap() = artifact_store;
+    state.counters().finding = finding_counter;
+    state.counters().tool = tool_id_counter;
     Ok((turn, streamed_text))
 }
 
@@ -1516,7 +1672,7 @@ fn run_agent_resume_turn<W: Write>(
 
 fn run_agent_tool(
     tool_registry: &ToolRegistry,
-    sqlite_store: &SqliteStore,
+    sqlite_store: &std::sync::Mutex<SqliteStore>,
     artifact_store: &mut ArtifactStore,
     capture_status: &Value,
     finding_counter: &mut u64,
@@ -1586,7 +1742,7 @@ fn run_agent_tool(
                 &context,
                 &execution.tool_name,
                 &execution.input,
-                sqlite_store,
+                &sqlite_store.lock().unwrap(),
                 artifact_store,
                 finding_counter,
                 tool_id_counter,
@@ -1597,7 +1753,7 @@ fn run_agent_tool(
                 &context,
                 &execution.tool_name,
                 &execution.input,
-                sqlite_store,
+                &sqlite_store.lock().unwrap(),
                 artifact_store,
                 capture_status,
             )
@@ -1661,9 +1817,7 @@ fn finalize_agent_respond_permission<W: Write>(
             .to_string(),
     };
 
-    state
-        .sqlite_store
-        .insert_tool_call(&pending.tool_call)
+    state.store().insert_tool_call(&pending.tool_call)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -1712,9 +1866,9 @@ fn finalize_agent_respond_permission<W: Write>(
 
     // High-risk respond requests always need the modal + typed confirmation,
     // even when an always-rule exists for the pattern.
-    let decision = state.permission_manager.ask(request.clone());
+    let decision = state.permission().ask(request.clone());
     if decision == PermissionDecision::AllowedAlways {
-        state.permission_manager.restore_pending(request.clone());
+        state.permission().restore_pending(request.clone());
     }
 
     let pending_respond = PendingRespond {
@@ -1728,20 +1882,16 @@ fn finalize_agent_respond_permission<W: Write>(
         message: format!("failed to encode pending respond: {error}"),
     })?;
     if let Err(message) =
-        state
-            .sqlite_store
-            .save_pending_permission(&request, &continuation)
+        state.store().save_pending_permission(&request, &continuation)
     {
-        state.permission_manager.remove_pending(&request.id);
-        let _ = state
-            .sqlite_store
-            .update_tool_call_status(&pending.tool_call.id, ToolCallStatus::Error);
+        state.permission().remove_pending(&request.id);
+        let _ = state.store().update_tool_call_status(&pending.tool_call.id, ToolCallStatus::Error);
         return Err(RpcError {
             code: -32011,
             message,
         });
     }
-    state.pending_respond = Some(pending_respond);
+    *state.pending_respond() = Some(pending_respond);
     set_session_run_state(state, session_id, RunState::WaitingPermission)?;
     let _ = emit_event(writer, "permission.asked", json!({ "request": request }));
 
@@ -1780,9 +1930,7 @@ fn finalize_agent_capture_permission<W: Write>(
         .unwrap_or(10)
         .clamp(1, 10);
 
-    state
-        .sqlite_store
-        .insert_tool_call(&pending.tool_call)
+    state.store().insert_tool_call(&pending.tool_call)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -1823,7 +1971,8 @@ fn finalize_agent_capture_permission<W: Write>(
         }),
     );
 
-    match state.permission_manager.ask(request.clone()) {
+    let permission_decision = state.permission().ask(request.clone());
+    match permission_decision {
         PermissionDecision::Pending => {
             let pending_capture = PendingCapture {
                 request_id: request.id.clone(),
@@ -1839,20 +1988,16 @@ fn finalize_agent_capture_permission<W: Write>(
                     message: format!("failed to encode pending capture: {error}"),
                 })?;
             if let Err(message) =
-                state
-                    .sqlite_store
-                    .save_pending_permission(&request, &continuation)
+                state.store().save_pending_permission(&request, &continuation)
             {
-                state.permission_manager.remove_pending(&request.id);
-                let _ = state
-                    .sqlite_store
-                    .update_tool_call_status(&pending.tool_call.id, ToolCallStatus::Error);
+                state.permission().remove_pending(&request.id);
+                let _ = state.store().update_tool_call_status(&pending.tool_call.id, ToolCallStatus::Error);
                 return Err(RpcError {
                     code: -32011,
                     message,
                 });
             }
-            state.pending_capture = Some(pending_capture);
+            *state.pending_capture() = Some(pending_capture);
             set_session_run_state(state, session_id, RunState::WaitingPermission)?;
             let _ = emit_event(writer, "permission.asked", json!({ "request": request }));
             Ok(json!({
@@ -1938,15 +2083,15 @@ fn build_resume_outcome_summary(payload: &Value) -> String {
 /// Load all persisted sessions (with their messages) from SQLite and restore them
 /// into the agent runtime so conversation context survives restarts.
 fn restore_agent_sessions(state: &mut CoreState) -> Result<usize, String> {
-    let sessions = state.sqlite_store.list_sessions()?;
+    let sessions = state.store().list_sessions()?;
     if sessions.is_empty() {
         return Ok(0);
     }
 
     let mut records = Vec::with_capacity(sessions.len());
     for session in sessions {
-        let messages = state.sqlite_store.load_messages(&session.id)?;
-        let steps = state.sqlite_store.load_steps(&session.id)?;
+        let messages = state.store().load_messages(&session.id)?;
+        let steps = state.store().load_steps(&session.id)?;
         records.push(SessionRecord {
             session,
             messages,
@@ -1955,46 +2100,47 @@ fn restore_agent_sessions(state: &mut CoreState) -> Result<usize, String> {
     }
 
     let count = records.len();
-    state.agent_runtime.restore_sessions(records);
+    state.agent_runtime.lock().unwrap().restore_sessions(records);
     Ok(count)
 }
 
 fn restore_core_counters(state: &mut CoreState) -> Result<(), String> {
-    let counters = state.sqlite_store.persistent_counters()?;
-    state.permission_counter = counters.permission;
-    state.capture_counter = counters.capture_or_call;
-    state.tool_counter = counters.tool_data;
-    state.finding_counter = counters.finding;
+    let counters = state.store().persistent_counters()?;
+    state.counters().permission = counters.permission;
+    state.counters().capture = counters.capture_or_call;
+    state.counters().tool = counters.tool_data;
+    state.counters().finding = counters.finding;
     Ok(())
 }
 
 fn restore_pending_permissions(state: &mut CoreState) -> Result<usize, String> {
-    let pending = state.sqlite_store.list_pending_permissions()?;
+    let pending = state.store().list_pending_permissions()?;
     let count = pending.len();
 
     for stored in pending {
-        state.permission_counter = state
-            .permission_counter
-            .max(id_suffix(&stored.request.id).unwrap_or(0));
-        state.capture_counter = state
-            .capture_counter
-            .max(id_suffix(&stored.request.tool.call_id).unwrap_or(0));
-        state
-            .permission_manager
-            .restore_pending(stored.request.clone());
+        {
+            let mut counters = state.counters();
+            counters.permission = counters
+                .permission
+                .max(id_suffix(&stored.request.id).unwrap_or(0));
+            counters.capture = counters
+                .capture
+                .max(id_suffix(&stored.request.tool.call_id).unwrap_or(0));
+        }
+        state.permission().restore_pending(stored.request.clone());
 
-        if state.pending_capture.is_none()
+        if state.pending_capture().is_none()
             && let Ok(capture) =
                 serde_json::from_value::<PendingCapture>(stored.continuation.clone())
         {
-            state.pending_capture = Some(capture);
+            *state.pending_capture() = Some(capture);
             continue;
         }
-        if state.pending_respond.is_none()
+        if state.pending_respond().is_none()
             && let Ok(respond) =
                 serde_json::from_value::<PendingRespond>(stored.continuation.clone())
         {
-            state.pending_respond = Some(respond);
+            *state.pending_respond() = Some(respond);
         }
     }
 
@@ -2002,8 +2148,8 @@ fn restore_pending_permissions(state: &mut CoreState) -> Result<usize, String> {
 }
 
 fn restore_permission_rules(state: &mut CoreState) -> Result<(), String> {
-    let rules = state.sqlite_store.list_permission_rules()?;
-    state.permission_manager.persist_always_rule(&rules);
+    let rules = state.store().list_permission_rules()?;
+    state.permission().persist_always_rule(&rules);
     Ok(())
 }
 
@@ -2016,15 +2162,15 @@ fn set_session_run_state(
     session_id: &str,
     run_state: RunState,
 ) -> Result<(), RpcError> {
-    state
-        .sqlite_store
-        .update_session_run_state(session_id, run_state)
+    state.store().update_session_run_state(session_id, run_state)
         .map_err(|message| RpcError {
             code: -32011,
             message,
         })?;
     state
         .agent_runtime
+        .lock()
+        .unwrap()
         .set_session_run_state(session_id, run_state);
     Ok(())
 }
@@ -2045,9 +2191,7 @@ fn persist_agent_turn(store: &SqliteStore, turn: &AgentTurn) -> Result<(), Strin
 }
 
 fn handle_session_list(state: &CoreState) -> Result<Value, RpcError> {
-    let sessions = state
-        .sqlite_store
-        .list_sessions()
+    let sessions = state.store().list_sessions()
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2059,9 +2203,7 @@ fn handle_session_list(state: &CoreState) -> Result<Value, RpcError> {
 
 fn handle_session_get(state: &CoreState, params: &Value) -> Result<Value, RpcError> {
     let session_id = required_string_param(params, "session_id")?;
-    let session = state
-        .sqlite_store
-        .load_session(session_id)
+    let session = state.store().load_session(session_id)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2070,23 +2212,17 @@ fn handle_session_get(state: &CoreState, params: &Value) -> Result<Value, RpcErr
             code: -32012,
             message: format!("session not found: {session_id}"),
         })?;
-    let messages = state
-        .sqlite_store
-        .load_messages(session_id)
+    let messages = state.store().load_messages(session_id)
         .map_err(|message| RpcError {
             code: -32011,
             message,
         })?;
-    let steps = state
-        .sqlite_store
-        .load_steps(session_id)
+    let steps = state.store().load_steps(session_id)
         .map_err(|message| RpcError {
             code: -32011,
             message,
         })?;
-    let tool_calls = state
-        .sqlite_store
-        .load_tool_calls(session_id)
+    let tool_calls = state.store().load_tool_calls(session_id)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2095,9 +2231,7 @@ fn handle_session_get(state: &CoreState, params: &Value) -> Result<Value, RpcErr
         .iter()
         .flat_map(|message| message.parts.iter().cloned())
         .collect::<Vec<_>>();
-    let pending_permissions = state
-        .sqlite_store
-        .list_pending_permissions()
+    let pending_permissions = state.store().list_pending_permissions()
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2119,9 +2253,7 @@ fn handle_session_get(state: &CoreState, params: &Value) -> Result<Value, RpcErr
 
 fn handle_message_list(state: &CoreState, params: &Value) -> Result<Value, RpcError> {
     let session_id = required_string_param(params, "session_id")?;
-    let messages = state
-        .sqlite_store
-        .load_messages(session_id)
+    let messages = state.store().load_messages(session_id)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2181,16 +2313,16 @@ fn request_capture_permission<W: Write>(
         message_id,
         step_id,
     } = input;
-    if state.pending_capture.is_some() {
+    if state.pending_capture().is_some() {
         return Err(RpcError {
             code: -32003,
             message: String::from("A capture permission request is already pending."),
         });
     }
 
-    let call_id = next_counter_id("call", &mut state.capture_counter);
+    let call_id = next_counter_id("call", &mut state.counters().capture);
     let request = PermissionRequest {
-        id: next_counter_id("per", &mut state.permission_counter),
+        id: next_counter_id("per", &mut state.counters().permission),
         session_id: session_id.to_string(),
         permission: PermissionKind::CaptureLive,
         patterns: vec![interface.to_string(), filter.to_string()],
@@ -2226,15 +2358,14 @@ fn request_capture_permission<W: Write>(
         .to_string(),
         status: ToolCallStatus::Pending,
     };
-    state
-        .sqlite_store
-        .insert_tool_call(&tool_call)
+    state.store().insert_tool_call(&tool_call)
         .map_err(|message| RpcError {
             code: -32011,
             message,
         })?;
 
-    match state.permission_manager.ask(request.clone()) {
+    let permission_decision = state.permission().ask(request.clone());
+    match permission_decision {
         PermissionDecision::Pending => {
             let pending_capture = PendingCapture {
                 request_id: request.id.clone(),
@@ -2249,20 +2380,16 @@ fn request_capture_permission<W: Write>(
                     code: -32011,
                     message: format!("failed to encode pending capture: {error}"),
                 })?;
-            if let Err(message) = state
-                .sqlite_store
-                .save_pending_permission(&request, &continuation)
+            if let Err(message) = state.store().save_pending_permission(&request, &continuation)
             {
-                state.permission_manager.remove_pending(&request.id);
-                let _ = state
-                    .sqlite_store
-                    .update_tool_call_status(&request.tool.call_id, ToolCallStatus::Error);
+                state.permission().remove_pending(&request.id);
+                let _ = state.store().update_tool_call_status(&request.tool.call_id, ToolCallStatus::Error);
                 return Err(RpcError {
                     code: -32011,
                     message,
                 });
             }
-            state.pending_capture = Some(pending_capture);
+            *state.pending_capture() = Some(pending_capture);
             set_session_run_state(state, session_id, RunState::WaitingPermission)?;
             let _ = emit_event(
                 writer,
@@ -2334,7 +2461,7 @@ fn handle_permission_reply<W: Write>(
     let persisted_reply = reply.clone();
 
     let outcome = state
-        .permission_manager
+        .permission()
         .reply(reply)
         .ok_or_else(|| RpcError {
             code: -32602,
@@ -2352,9 +2479,9 @@ fn handle_permission_reply<W: Write>(
         });
     }
 
-    if let Err(message) = state.sqlite_store.resolve_permission(&persisted_reply) {
+    if let Err(message) = state.store().resolve_permission(&persisted_reply) {
         state
-            .permission_manager
+            .permission()
             .restore_pending(outcome.request.clone());
         return Err(RpcError {
             code: -32011,
@@ -2381,9 +2508,7 @@ fn handle_permission_reply<W: Write>(
     };
 
     if result.is_err() && is_approval {
-        let _ = state
-            .sqlite_store
-            .update_tool_call_status(&tool_call_id, ToolCallStatus::Error);
+        let _ = state.store().update_tool_call_status(&tool_call_id, ToolCallStatus::Error);
         let _ = set_session_run_state(state, &tool_session_id, RunState::Error);
         let _ = emit_event(
             writer,
@@ -2412,21 +2537,20 @@ fn handle_capture_permission_outcome<W: Write>(
         PermissionDecision::AllowedOnce => {
             start_capture_from_pending(state, writer, &outcome.request.id, "approved_once")
         }
-        PermissionDecision::AllowedAlways => state
-            .sqlite_store
-            .save_permission_rules(&outcome.request.always)
-            .map_err(|message| RpcError {
-                code: -32011,
-                message,
-            })
-            .and_then(|_| {
-                start_capture_from_pending(state, writer, &outcome.request.id, "approved_always")
-            }),
+        PermissionDecision::AllowedAlways => {
+            let saved = state.store().save_permission_rules(&outcome.request.always);
+            saved
+                .map_err(|message| RpcError {
+                    code: -32011,
+                    message,
+                })
+                .and_then(|_| {
+                    start_capture_from_pending(state, writer, &outcome.request.id, "approved_always")
+                })
+        }
         PermissionDecision::Rejected => {
-            state.pending_capture = None;
-            state
-                .sqlite_store
-                .update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Aborted)
+            *state.pending_capture() = None;
+            state.store().update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Aborted)
                 .map_err(|message| RpcError {
                     code: -32011,
                     message,
@@ -2446,7 +2570,7 @@ fn handle_capture_permission_outcome<W: Write>(
                     "feedback": outcome.feedback,
                 }),
             );
-            let _ = state.sqlite_store.save_agent_resume(
+            let _ = state.store().save_agent_resume(
                 &outcome.request.session_id,
                 &json!({
                     "status": "rejected",
@@ -2478,7 +2602,7 @@ fn handle_respond_permission_outcome<W: Write>(
     match outcome.decision {
         PermissionDecision::AllowedOnce | PermissionDecision::AllowedAlways => {
             let pending = state
-                .pending_respond
+                .pending_respond()
                 .take()
                 .filter(|pending| pending.request_id == outcome.request.id)
                 .ok_or_else(|| RpcError {
@@ -2493,9 +2617,7 @@ fn handle_respond_permission_outcome<W: Write>(
                 code: -32015,
                 message,
             })?;
-            state
-                .sqlite_store
-                .update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Completed)
+            state.store().update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Completed)
                 .map_err(|message| RpcError {
                     code: -32011,
                     message,
@@ -2532,7 +2654,7 @@ fn handle_respond_permission_outcome<W: Write>(
                     "artifact": artifact,
                 }),
             );
-            let _ = state.sqlite_store.save_agent_resume(
+            let _ = state.store().save_agent_resume(
                 &outcome.request.session_id,
                 &json!({
                     "status": "approved",
@@ -2551,10 +2673,8 @@ fn handle_respond_permission_outcome<W: Write>(
             }))
         }
         PermissionDecision::Rejected => {
-            state.pending_respond = None;
-            state
-                .sqlite_store
-                .update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Aborted)
+            *state.pending_respond() = None;
+            state.store().update_tool_call_status(&outcome.request.tool.call_id, ToolCallStatus::Aborted)
                 .map_err(|message| RpcError {
                     code: -32011,
                     message,
@@ -2574,7 +2694,7 @@ fn handle_respond_permission_outcome<W: Write>(
                     "feedback": outcome.feedback,
                 }),
             );
-            let _ = state.sqlite_store.save_agent_resume(
+            let _ = state.store().save_agent_resume(
                 &outcome.request.session_id,
                 &json!({
                     "status": "rejected",
@@ -2607,9 +2727,7 @@ fn build_firewall_proposal_artifact(
     let mut finding_ref = String::from("(none)");
     if let Some(finding_id) = &proposal.finding_id {
         finding_ref = finding_id.clone();
-        if let Some(finding) = state
-            .sqlite_store
-            .load_finding_by_id(finding_id)
+        if let Some(finding) = state.store().load_finding_by_id(finding_id)
             .map_err(|message| format!("failed to load finding: {message}"))?
         {
             finding_title = finding.title.clone();
@@ -2621,9 +2739,7 @@ fn build_firewall_proposal_artifact(
             }
         }
     }
-    for flow in state
-        .sqlite_store
-        .list_flows()
+    for flow in state.store().list_flows()
         .map_err(|message| format!("failed to list flows: {message}"))?
         .into_iter()
         .filter(|flow| flow.src_ip == proposal.target || flow.dst_ip == proposal.target)
@@ -2665,7 +2781,7 @@ fn build_firewall_proposal_artifact(
         },
     );
     let artifact = state
-        .artifact_store
+        .artifacts()
         .write_text_artifact(
             "firewall-proposal",
             "md",
@@ -2694,7 +2810,7 @@ fn handle_capture_status(state: &mut CoreState) -> Result<Value, RpcError> {
 }
 
 fn capture_status_snapshot(state: &CoreState) -> Value {
-    match &state.capture_job {
+    match &*state.capture() {
         Some(job) => json!({
             "status": "running",
             "capture_id": job.id,
@@ -2712,7 +2828,8 @@ fn capture_status_snapshot(state: &CoreState) -> Value {
 }
 
 fn handle_capture_stop<W: Write>(state: &mut CoreState, writer: &mut W) -> Result<Value, RpcError> {
-    if let Some(job) = state.capture_job.take() {
+    let job = state.capture().take();
+    if let Some(job) = job {
         let result =
             finalize_capture_job(state, writer, job, "stopped_by_user").map_err(|error| {
                 RpcError {
@@ -2762,7 +2879,7 @@ fn start_capture_from_pending<W: Write>(
     approval_status: &str,
 ) -> Result<Value, RpcError> {
     let pending = state
-        .pending_capture
+        .pending_capture()
         .take()
         .filter(|capture| capture.request_id == request_id)
         .ok_or_else(|| RpcError {
@@ -2799,14 +2916,14 @@ fn start_capture_job<W: Write>(
         tool_call_id,
         request_id,
     } = input;
-    if state.capture_job.is_some() {
+    if state.capture().is_some() {
         return Err(RpcError {
             code: -32003,
             message: String::from("Only one capture job is supported in Phase 6."),
         });
     }
 
-    let capture_id = next_counter_id("cap", &mut state.capture_counter);
+    let capture_id = next_counter_id("cap", &mut state.counters().capture);
     let mut capture_dir = std::env::temp_dir();
     capture_dir.push("netagent-captures");
     std::fs::create_dir_all(&capture_dir).map_err(|error| RpcError {
@@ -2815,9 +2932,7 @@ fn start_capture_job<W: Write>(
     })?;
 
     let pcap_path = capture_dir.join(format!("{capture_id}.pcap"));
-    state
-        .sqlite_store
-        .update_tool_call_status(tool_call_id, ToolCallStatus::Running)
+    state.store().update_tool_call_status(tool_call_id, ToolCallStatus::Running)
         .map_err(|message| RpcError {
             code: -32011,
             message,
@@ -2825,10 +2940,8 @@ fn start_capture_job<W: Write>(
     let child = match spawn_tcpdump(interface, filter, &pcap_path) {
         Ok(child) => child,
         Err(error) => {
-            let _ = state
-                .sqlite_store
-                .update_tool_call_status(tool_call_id, ToolCallStatus::Error);
-            let _ = state.sqlite_store.save_agent_resume(
+            let _ = state.store().update_tool_call_status(tool_call_id, ToolCallStatus::Error);
+            let _ = state.store().save_agent_resume(
                 session_id,
                 &json!({
                     "status": "failed",
@@ -2860,7 +2973,7 @@ fn start_capture_job<W: Write>(
         message: format!("failed to emit capture.started: {error}"),
     })?;
 
-    state.capture_job = Some(CaptureJob {
+    *state.capture() = Some(CaptureJob {
         id: capture_id.clone(),
         session_id: session_id.to_string(),
         tool_call_id: tool_call_id.to_string(),
@@ -2938,13 +3051,14 @@ fn spawn_tcpdump(interface: &str, filter: &str, pcap_path: &PathBuf) -> Result<C
 }
 
 fn reconcile_capture_state<W: Write>(state: &mut CoreState, writer: &mut W) -> io::Result<()> {
-    let should_finalize = match state.capture_job.as_mut() {
+    let should_finalize = match state.capture().as_mut() {
         Some(job) if job.started_at.elapsed() >= Duration::from_secs(job.duration_secs) => true,
         Some(job) => job.child.try_wait()?.is_some(),
         None => false,
     };
 
-    if should_finalize && let Some(job) = state.capture_job.take() {
+    let job = if should_finalize { state.capture().take() } else { None };
+    if let Some(job) = job {
         let _ = finalize_capture_job(state, writer, job, "completed")?;
     }
 
@@ -2964,14 +3078,12 @@ fn finalize_capture_job<W: Write>(
         "Capture {} on {} with filter {}",
         job.id, job.interface, job.filter
     );
-    let artifact = state.artifact_store.register_pcap(&job.pcap_path, &note);
-    state
-        .sqlite_store
-        .update_tool_call_status(&job.tool_call_id, ToolCallStatus::Completed)
+    let artifact = state.artifacts().register_pcap(&job.pcap_path, &note);
+    state.store().update_tool_call_status(&job.tool_call_id, ToolCallStatus::Completed)
         .map_err(io::Error::other)?;
     set_session_run_state(state, &job.session_id, RunState::Idle)
         .map_err(|error| io::Error::other(error.message))?;
-    let _ = state.sqlite_store.save_agent_resume(
+    let _ = state.store().save_agent_resume(
         &job.session_id,
         &json!({
             "status": "approved",
@@ -3056,33 +3168,29 @@ fn handle_pcap_open<W: Write>(
 
     // Assign IDs
     for flow in &mut flows {
-        flow.id = next_counter_id("flow", &mut state.tool_counter);
+        flow.id = next_counter_id("flow", &mut state.counters().tool);
     }
     for event in &mut dns_events {
-        event.id = next_counter_id("dns", &mut state.tool_counter);
+        event.id = next_counter_id("dns", &mut state.counters().tool);
     }
 
     let flow_count = flows.len();
     let dns_count = dns_events.len();
 
-    let flow_inserted = state
-        .sqlite_store
-        .insert_flows(&flows)
+    let flow_inserted = state.store().insert_flows(&flows)
         .map_err(|e| RpcError {
             code: -32007,
             message: e,
         })?;
 
-    let dns_inserted = state
-        .sqlite_store
-        .insert_dns_events(&dns_events)
+    let dns_inserted = state.store().insert_dns_events(&dns_events)
         .map_err(|e| RpcError {
             code: -32007,
             message: e,
         })?;
 
     let artifact = state
-        .artifact_store
+        .artifacts()
         .register_pcap(path, &format!("pcap opened from {path}"));
     let _ = emit_event(writer, "artifact.created", json!({ "artifact": artifact }));
 
@@ -3199,12 +3307,10 @@ fn handle_tshark_extract_flows<W: Write>(
     })?;
 
     for flow in &mut flows {
-        flow.id = next_counter_id("flow", &mut state.tool_counter);
+        flow.id = next_counter_id("flow", &mut state.counters().tool);
     }
 
-    let inserted = state
-        .sqlite_store
-        .insert_flows(&flows)
+    let inserted = state.store().insert_flows(&flows)
         .map_err(|e| RpcError {
             code: -32007,
             message: e,
@@ -3246,12 +3352,10 @@ fn handle_tshark_extract_dns<W: Write>(
     })?;
 
     for event in &mut dns_events {
-        event.id = next_counter_id("dns", &mut state.tool_counter);
+        event.id = next_counter_id("dns", &mut state.counters().tool);
     }
 
-    let inserted = state
-        .sqlite_store
-        .insert_dns_events(&dns_events)
+    let inserted = state.store().insert_dns_events(&dns_events)
         .map_err(|e| RpcError {
             code: -32007,
             message: e,
@@ -3301,7 +3405,7 @@ fn handle_dns_detect_anomalies<W: Write>(
         }
     }
 
-    let findings = run_all_rules(&manifests, &state.sqlite_store, &mut state.finding_counter)
+    let findings = run_all_rules(&manifests, &state.store(), &mut state.counters().finding)
         .map_err(|message| RpcError {
             code: -32008,
             message: format!("failed to run analyzer rules: {message}"),
@@ -3334,7 +3438,7 @@ fn handle_dns_detect_anomalies<W: Write>(
 // ── Phase 7: flow.list ──
 
 fn handle_flow_list(state: &CoreState) -> Result<Value, RpcError> {
-    let flows = state.sqlite_store.list_flows().map_err(|e| RpcError {
+    let flows = state.store().list_flows().map_err(|e| RpcError {
         code: -32007,
         message: e,
     })?;
@@ -3348,7 +3452,7 @@ fn handle_flow_list(state: &CoreState) -> Result<Value, RpcError> {
 // ── Phase 7: finding.list ──
 
 fn handle_finding_list(state: &CoreState) -> Result<Value, RpcError> {
-    let findings = state.sqlite_store.list_findings().map_err(|e| RpcError {
+    let findings = state.store().list_findings().map_err(|e| RpcError {
         code: -32007,
         message: e,
     })?;
@@ -3371,14 +3475,14 @@ fn handle_report_generate<W: Write>(
         .and_then(Value::as_str)
         .unwrap_or("NetAgent Report");
 
-    let input = collect_report_input(&state.sqlite_store, &state.artifact_store, title)
+    let input = collect_report_input(&state.store(), &state.artifacts(), title)
         .map_err(|message| RpcError {
             code: -32009,
             message,
         })?;
     let (content, metadata) = build_markdown_report(&input);
     let artifact = state
-        .artifact_store
+        .artifacts()
         .write_report("netagent-report", &content)
         .map_err(|message| RpcError {
             code: -32009,
@@ -3428,13 +3532,13 @@ fn handle_ioc_export<W: Write>(
     writer: &mut W,
     _params: &Value,
 ) -> Result<Value, RpcError> {
-    let document = build_ioc_export_document(&state.sqlite_store, &state.artifact_store)?;
+    let document = build_ioc_export_document(&state.store(), &state.artifacts())?;
     let content = serde_json::to_string_pretty(&document).map_err(|error| RpcError {
         code: -32009,
         message: format!("failed to serialize IOC export: {error}"),
     })?;
     let artifact = state
-        .artifact_store
+        .artifacts()
         .write_ioc_export("netagent-iocs", &content)
         .map_err(|message| RpcError {
             code: -32009,
@@ -3655,21 +3759,27 @@ mod tests {
 
     fn test_core_state(db_path: &std::path::Path) -> CoreState {
         CoreState {
-            agent_runtime: AgentRuntime::disabled(),
-            permission_manager: PermissionManager::default(),
+            agent_runtime: std::sync::Arc::new(std::sync::Mutex::new(
+                AgentRuntime::disabled(),
+            )),
+            permission_manager: std::sync::Arc::new(std::sync::Mutex::new(
+                PermissionManager::default(),
+            )),
             tool_registry: ToolRegistry,
-            artifact_store: ArtifactStore::default(),
-            sqlite_store: SqliteStore::open(db_path).expect("open sqlite store"),
+            artifact_store: std::sync::Arc::new(std::sync::Mutex::new(
+                ArtifactStore::default(),
+            )),
+            sqlite_store: std::sync::Arc::new(std::sync::Mutex::new(
+                SqliteStore::open(db_path).expect("open sqlite store"),
+            )),
             rule_manifests: Vec::new(),
-            capture_job: None,
-            pending_capture: None,
-            pending_respond: None,
+            capture_job: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            pending_capture: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            pending_respond: std::sync::Arc::new(std::sync::Mutex::new(None)),
             agent_abort: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            agent_abort_rx: None,
-            permission_counter: 0,
-            capture_counter: 0,
-            tool_counter: 0,
-            finding_counter: 0,
+            agent_abort_rx: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            agent_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            counters: std::sync::Arc::new(std::sync::Mutex::new(CoreCounters::default())),
         }
     }
 
@@ -4022,7 +4132,7 @@ mod tests {
         );
         assert!(response.result.is_none());
         assert!(events.is_empty());
-        assert!(state.artifact_store.list_artifacts().is_empty());
+        assert!(state.artifacts().list_artifacts().is_empty());
 
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(pcap_path);
@@ -4271,9 +4381,7 @@ mod tests {
         drop(state);
 
         let mut restored = test_core_state(&db_path);
-        restored
-            .sqlite_store
-            .reconcile_interrupted_runtime()
+        restored.store().reconcile_interrupted_runtime()
             .expect("reconcile runtime");
         assert_eq!(restore_agent_sessions(&mut restored).expect("sessions"), 1);
         assert_eq!(
@@ -4405,7 +4513,7 @@ mod tests {
         restore_permission_rules(&mut restored).expect("restore permission rules");
         assert!(
             restored
-                .permission_manager
+                .permission()
                 .evaluate(PermissionKind::CaptureLive, &[String::from("mock1")],)
         );
 
@@ -4505,8 +4613,8 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(state.permission_manager.list_pending().len(), 1);
-        assert!(state.capture_job.is_none());
+        assert_eq!(state.permission().list_pending().len(), 1);
+        assert!(state.capture().is_none());
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -4894,8 +5002,8 @@ mod tests {
 
         // Nothing was executed against the system: no pfctl subprocess exists
         // in this test path and the proposal is the only record.
-        assert!(state.capture_job.is_none());
-        assert!(state.pending_respond.is_none());
+        assert!(state.capture().is_none());
+        assert!(state.pending_respond().is_none());
 
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(pcap_path);

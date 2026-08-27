@@ -91,10 +91,9 @@ printf '{"jsonrpc":"2.0","id":4,"method":"permission.reply","params":{"request_i
 
 echo
 echo "--- Step 4: correct typed confirmation -> proposal artifact (NOT executed)"
-phase4_out="$(printf '%s\n%s\n%s\n' \
+phase4_out="$(printf '%s\n%s\n' \
   "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"permission.reply\",\"params\":{\"request_id\":\"$request_id\",\"decision\":\"once\",\"typed_confirmation\":\"BLOCK 10.0.0.8\"}}" \
-  "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"agent.resume\",\"params\":{\"session_id\":\"$session_id\"}}" \
-  "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"session.get\",\"params\":{\"session_id\":\"$session_id\"}}" |
+  "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"agent.resume\",\"params\":{\"session_id\":\"$session_id\"}}" |
   cargo run -q -p netagent-core 2>/dev/null)"
 printf '%s\n' "$phase4_out" | format_demo_output
 
@@ -109,7 +108,7 @@ fi
 
 echo
 echo "--- Step 5: restart recovery - the proposal decision survives a Core restart"
-printf '{"jsonrpc":"2.0","id":7,"method":"session.get","params":{"session_id":"%s"}}\n' "$session_id" |
+printf '{"jsonrpc":"2.0","id":6,"method":"session.get","params":{"session_id":"%s"}}\n' "$session_id" |
   cargo run -q -p netagent-core 2>/dev/null | format_demo_output
 
 echo
