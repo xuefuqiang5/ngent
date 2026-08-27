@@ -1846,6 +1846,7 @@ fn run_agent_tool(
             })
         }
         "pcap.open"
+        | "pcap.compare"
         | "tshark.extract_flows"
         | "tshark.extract_dns"
         | "zeek.process_pcap"
@@ -1872,6 +1873,7 @@ fn run_agent_tool(
                 &sqlite_store.lock().unwrap(),
                 artifact_store,
                 capture_status,
+                abort,
             )
             .map(ToolOutcome::Completed),
     }

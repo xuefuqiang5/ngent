@@ -1299,6 +1299,27 @@ impl AgentRuntime {
     fn fallback_plan(input: &str, step_id: &str) -> Vec<ChatToolCall> {
         let lower = input.to_lowercase();
 
+        if let Some(target) = Self::extract_network_target(input)
+            && (Self::contains_any(&lower, &["ping", "reachable", "connectivity", "access"])
+                || Self::contains_any(input, &["连通", "访问", "能否连接", "可达"]))
+        {
+            let url = Self::extract_http_url(input).unwrap_or_else(|| format!("https://{target}"));
+            return Self::fallback_plan_from_pairs(
+                step_id,
+                vec![
+                    (
+                        "network.dns_lookup",
+                        json!({"target": target, "record_type":"A"}),
+                    ),
+                    ("network.ping", json!({"target": target, "count":3})),
+                    ("network.tcp_connect", json!({"target": target, "port":443})),
+                    ("network.http_probe", json!({"url":url})),
+                    ("network.tls_inspect", json!({"target":target,"port":443})),
+                    ("system.route_lookup", json!({"target":target})),
+                ],
+            );
+        }
+
         if let Some(path) = Self::extract_pcap_path(input) {
             return Self::fallback_plan_from_pairs(
                 step_id,
@@ -1695,6 +1716,44 @@ impl AgentRuntime {
             .map(str::to_string)
     }
 
+    fn extract_http_url(input: &str) -> Option<String> {
+        input
+            .split_whitespace()
+            .map(|token| {
+                token.trim_matches(|character: char| {
+                    matches!(character, ',' | '，' | '。' | '?' | '？')
+                })
+            })
+            .find(|token| token.starts_with("http://") || token.starts_with("https://"))
+            .map(str::to_string)
+    }
+
+    fn extract_network_target(input: &str) -> Option<String> {
+        if let Some(url) = Self::extract_http_url(input) {
+            let authority = url.split_once("://")?.1.split('/').next()?;
+            let host = authority
+                .rsplit_once(':')
+                .map(|(host, _)| host)
+                .unwrap_or(authority);
+            if !host.is_empty() {
+                return Some(host.to_string());
+            }
+        }
+        input
+            .split(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '.' | ':' | '-'))
+            })
+            .find(|token| {
+                Self::looks_like_ip(token)
+                    || (token.contains('.')
+                        && token.len() <= 253
+                        && token.split('.').all(|label| {
+                            !label.is_empty() && !label.starts_with('-') && !label.ends_with('-')
+                        }))
+            })
+            .map(str::to_string)
+    }
+
     fn extract_finding_id(input: &str) -> Option<String> {
         input
             .split(|character: char| {
@@ -1746,7 +1805,7 @@ impl AgentRuntime {
             .chars()
             .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character));
         let heading = if chinese {
-            "已完成只读工具调查（本地可复现模式）。"
+            "已完成受控工具调查（本地可复现模式）。"
         } else {
             "Completed a read-only investigation using the deterministic local planner."
         };
@@ -1761,7 +1820,7 @@ impl AgentRuntime {
             .collect::<Vec<_>>()
             .join("\n");
         let conclusion = if chinese {
-            "\n\n结论：以上结论仅基于已存储的结构化证据；若记录为空，不能据此断言当前网络正常或异常。"
+            "\n\n结论：以上结论仅基于工具返回的有界证据；失败或空结果会保留为未知项，不能据此断言网络正常。"
         } else {
             "\n\nConclusion: this answer is limited to stored structured evidence. Empty records do not prove that the live network is healthy or unhealthy."
         };
@@ -1799,9 +1858,29 @@ impl AgentRuntime {
             "capture_status" => String::from("capture.status"),
             "capture_start" => String::from("capture.start"),
             "system_shell" => String::from("system.shell"),
+            "network_ping" => String::from("network.ping"),
+            "network_dns_lookup" => String::from("network.dns_lookup"),
+            "network_tcp_connect" => String::from("network.tcp_connect"),
+            "network_http_probe" => String::from("network.http_probe"),
+            "network_tls_inspect" => String::from("network.tls_inspect"),
+            "network_traceroute" => String::from("network.traceroute"),
+            "system_processes" => String::from("system.processes"),
+            "system_connections" => String::from("system.connections"),
+            "system_dns_config" => String::from("system.dns_config"),
+            "system_proxy_config" => String::from("system.proxy_config"),
+            "system_route_lookup" => String::from("system.route_lookup"),
+            "system_port_owner" => String::from("system.port_owner"),
+            "traffic_conversations" => String::from("traffic.conversations"),
+            "traffic_http_sessions" => String::from("traffic.http_sessions"),
+            "traffic_tls_sessions" => String::from("traffic.tls_sessions"),
+            "traffic_retransmissions" => String::from("traffic.retransmissions"),
+            "traffic_bandwidth_summary" => String::from("traffic.bandwidth_summary"),
+            "traffic_extract_iocs" => String::from("traffic.extract_iocs"),
+            "finding_explain" => String::from("finding.explain"),
             "artifact_list" => String::from("artifact.list"),
             "artifact_summary" => String::from("artifact.summary"),
             "pcap_open" => String::from("pcap.open"),
+            "pcap_compare" => String::from("pcap.compare"),
             "tshark_extract_flows" => String::from("tshark.extract_flows"),
             "tshark_extract_dns" => String::from("tshark.extract_dns"),
             "zeek_process_pcap" => String::from("zeek.process_pcap"),
@@ -2632,6 +2711,35 @@ mod tests {
         assert!(names.contains(&"artifact.list"));
         assert!(names.contains(&"artifact.summary"));
         assert!(!names.contains(&"capture.start"));
+    }
+
+    #[test]
+    fn fallback_plan_runs_bounded_connectivity_workflow() {
+        let calls = AgentRuntime::fallback_plan(
+            "你可以使用 ping 工具吗，我是否可以访问 google.com",
+            "step_network_0001",
+        );
+        let names = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "network.dns_lookup",
+                "network.ping",
+                "network.tcp_connect",
+                "network.http_probe",
+                "network.tls_inspect",
+                "system.route_lookup",
+            ]
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.function.arguments.contains("google.com"))
+        );
     }
 
     #[test]

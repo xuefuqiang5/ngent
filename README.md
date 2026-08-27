@@ -71,14 +71,18 @@ Conversation history renders inside a bottom-following scroll viewport. Long or 
 
 ## Current agent tools
 
-The model/local planner can call 16 typed tools. All are executed by the Rust Tool Runtime with full session/message/part/call context, and every result is a bounded summary plus structured output and `ArtifactRef` values — raw packet or command output never enters the model context:
+The model/local planner can call 36 typed tools. All are executed by the Rust Tool Runtime with full session/message/part/call context, and every result is a bounded summary plus structured output and `ArtifactRef` values — raw packet or command output never enters the model context:
 
 - `flow.list` / `finding.list` — list up to 25 stored flows/findings.
 - `capture.status` — inspect capture state without starting or stopping capture.
 - `system.shell` — actively inspect missing local facts through six read-only operations: `interfaces`, `routes`, `listeners`, `tool_versions`, `capture_preflight`, and `system_info`. This is not a general shell: Core owns fixed executable paths/arguments, clears the child environment, enforces time/output bounds, and stores bounded captured output as an artifact. Command text, pipes, redirects, environment reads, arbitrary programs, and file changes are not accepted.
+- `network.ping` / `network.dns_lookup` / `network.tcp_connect` / `network.http_probe` / `network.tls_inspect` / `network.traceroute` — bounded active connectivity diagnostics. Targets, URLs, ports, probe counts, redirects, hops, and timeouts are schema-validated; Core selects every executable and argument.
+- `system.processes` / `system.connections` / `system.dns_config` / `system.proxy_config` / `system.route_lookup` / `system.port_owner` — bounded local process, socket, resolver, proxy, route, and port-owner inspection without environment or arbitrary shell access.
 - `artifact.list` / `artifact.summary` — list/describe artifact references without raw contents.
 - `capture.start` — request a bounded live capture. The Agent loop pauses and the Core raises a `PermissionRequest` (tool, risk, command preview, interface, filter, duration). `agent.resume` continues the loop after the user decides; rejection feedback makes the Agent replan (offline pcap analysis by default). `capture.stop` is deliberately not an agent tool.
-- `pcap.open` / `tshark.extract_flows` / `tshark.extract_dns` — parse and persist offline pcap evidence.
+- `pcap.open` / `pcap.compare` / `tshark.extract_flows` / `tshark.extract_dns` — parse, persist, or compare offline pcap evidence without returning raw packets.
+- `traffic.conversations` / `traffic.http_sessions` / `traffic.tls_sessions` / `traffic.retransmissions` / `traffic.bandwidth_summary` / `traffic.extract_iocs` — bounded views over already-persisted flow and DNS evidence.
+- `finding.explain` — return one finding with its entities, recommendations, and traceable evidence references.
 - `zeek.process_pcap` / `suricata.process_pcap` — run fixed-argument, time-bounded and abortable offline sensor analysis, persist structured flow/DNS/alert records, and retain bounded raw logs as artifacts. `agent.abort` terminates a running sensor child before any partial logs or records are committed. Missing binaries return a bounded tshark fallback instead of failing the Agent loop.
 - `dns.detect_anomalies` — NXDOMAIN spike rule over stored DNS events; creates `finding.created`.
 - `report.generate` / `ioc.export` — Markdown evidence report and IOC JSON document artifacts.
@@ -95,7 +99,7 @@ For every request, the Agent persists and displays a concise execution brief con
 In the TUI:
 
 1. Ask `目标：判断当前已经保存了哪些网络证据。请先分析目标并制定计划，再调用只读工具，最后区分已知项和未知项。`.
-2. Watch the TUI show the configured model, the 12 available Agent tools, goal analysis, selected tools, bounded observations, and final answer.
+2. Watch the TUI show the configured model, the available Agent tools, goal analysis, selected tools, bounded observations, and final answer.
 3. Ask `请抓包看看当前网络是否有异常流量`. The agent calls `capture.start`, the Core raises a permission request, and the Approval Modal appears with the command preview.
 4. Press `F` (reject with feedback) to watch the Agent replan with offline pcap analysis. Press `N` for a plain rejection. Press `Y`/`A` only when the host allows `tcpdump`.
 5. Restart the TUI. The latest conversation, tool-call/result parts, and any still-pending approval are restored from SQLite.

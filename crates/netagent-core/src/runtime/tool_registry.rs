@@ -1,6 +1,7 @@
 use netagent_models::{AgentMode, ArtifactRef};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::AtomicBool;
 
 use crate::analyzers::rules::{load_rule_manifests, run_all_rules};
@@ -9,7 +10,7 @@ use crate::reports::markdown::{
 };
 use crate::storage::artifact_store::ArtifactStore;
 use crate::storage::sqlite::SqliteStore;
-use crate::tools::{suricata, system_shell, tshark, zeek};
+use crate::tools::{network_diag, suricata, system_shell, tshark, zeek};
 
 const DEFAULT_LIST_LIMIT: usize = 12;
 const MAX_LIST_LIMIT: usize = 25;
@@ -141,7 +142,7 @@ impl ToolRegistry {
     }
 
     pub fn readonly_defs(&self) -> Vec<ToolDef> {
-        vec![
+        let mut defs = vec![
             ToolDef {
                 id: String::from("flow.list"),
                 description: String::from(
@@ -223,7 +224,10 @@ impl ToolRegistry {
                 timeout_ms: Some(1_000),
                 truncate_at: 1,
             },
-        ]
+        ];
+        defs.extend(diagnostic_defs());
+        defs.extend(evidence_summary_defs());
+        defs
     }
 
     /// Bounded offline analysis tools (layer 2). All parse or summarize stored
@@ -273,6 +277,24 @@ impl ToolRegistry {
                 permissions: Vec::new(),
                 risk: String::from("low"),
                 timeout_ms: Some(30_000),
+                truncate_at: 8,
+            },
+            ToolDef {
+                id: String::from("pcap.compare"),
+                description: String::from(
+                    "Compare two local pcap files with bounded tshark parsing and return flow and DNS count deltas without raw packets.",
+                ),
+                input_schema: object_schema(
+                    json!({
+                        "left_path": {"type":"string","minLength":1},
+                        "right_path": {"type":"string","minLength":1}
+                    }),
+                    &["left_path", "right_path"],
+                ),
+                output_schema: standard_output_schema(),
+                permissions: Vec::new(),
+                risk: String::from("low"),
+                timeout_ms: Some(60_000),
                 truncate_at: 8,
             },
             ToolDef {
@@ -379,6 +401,7 @@ impl ToolRegistry {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run_readonly_tool(
         &self,
         context: &ToolContext,
@@ -387,6 +410,7 @@ impl ToolRegistry {
         sqlite_store: &SqliteStore,
         artifact_store: &mut ArtifactStore,
         capture_status: &Value,
+        abort: &AtomicBool,
     ) -> Result<ToolResult, String> {
         validate_context(context)?;
         let object = validate_object_input(input)?;
@@ -454,6 +478,16 @@ impl ToolRegistry {
                 })
             }
             "system.shell" => system_shell::run(object, artifact_store),
+            tool if network_diag::TOOL_IDS.contains(&tool) => {
+                network_diag::run(tool, object, artifact_store, abort)
+            }
+            "traffic.conversations" => summarize_conversations(object, sqlite_store),
+            "traffic.http_sessions" => summarize_service_sessions(object, sqlite_store, "http"),
+            "traffic.tls_sessions" => summarize_service_sessions(object, sqlite_store, "tls"),
+            "traffic.retransmissions" => summarize_retransmissions(object, sqlite_store),
+            "traffic.bandwidth_summary" => summarize_bandwidth(object, sqlite_store),
+            "traffic.extract_iocs" => summarize_iocs(object, sqlite_store),
+            "finding.explain" => explain_finding(object, sqlite_store),
             "artifact.list" => {
                 let limit = validate_list_input(object)?;
                 let artifacts = artifact_store.list_artifacts();
@@ -642,6 +676,34 @@ impl ToolRegistry {
                     }),
                     artifacts: Vec::new(),
                     truncated: dns_events.len() > samples.len(),
+                    raw_output_artifact: None,
+                })
+            }
+            "pcap.compare" => {
+                reject_unknown_fields(object, &["left_path", "right_path"])?;
+                let left_path = required_path_field(object, "left_path")?;
+                let right_path = required_path_field(object, "right_path")?;
+                let left_flows = tshark::extract_flows(std::path::Path::new(&left_path))?;
+                let left_dns = tshark::extract_dns(std::path::Path::new(&left_path))?;
+                let right_flows = tshark::extract_flows(std::path::Path::new(&right_path))?;
+                let right_dns = tshark::extract_dns(std::path::Path::new(&right_path))?;
+                Ok(ToolResult {
+                    title: String::from("PCAP comparison"),
+                    summary: format!(
+                        "Compared {left_path} with {right_path}: flows {} -> {}, DNS events {} -> {}. Raw packets were not returned.",
+                        left_flows.len(),
+                        right_flows.len(),
+                        left_dns.len(),
+                        right_dns.len()
+                    ),
+                    structured: json!({
+                        "left": {"path":left_path,"flows":left_flows.len(),"dns_events":left_dns.len()},
+                        "right": {"path":right_path,"flows":right_flows.len(),"dns_events":right_dns.len()},
+                        "delta": {"flows":right_flows.len() as i64-left_flows.len() as i64,"dns_events":right_dns.len() as i64-left_dns.len() as i64},
+                        "raw_packets_included": false
+                    }),
+                    artifacts: Vec::new(),
+                    truncated: false,
                     raw_output_artifact: None,
                 })
             }
@@ -1226,6 +1288,339 @@ fn list_input_schema() -> Value {
     )
 }
 
+fn diagnostic_defs() -> Vec<ToolDef> {
+    let specs = [
+        (
+            "network.ping",
+            "Send a bounded ICMP echo probe and return packet loss and latency output.",
+            target_schema_with(json!({"count":{"type":"integer","minimum":1,"maximum":5}})),
+        ),
+        (
+            "network.dns_lookup",
+            "Resolve a DNS name using a bounded fixed resolver command.",
+            target_schema_with(
+                json!({"record_type":{"type":"string","enum":["A","AAAA","CNAME","MX","NS","TXT","PTR"]}}),
+            ),
+        ),
+        (
+            "network.tcp_connect",
+            "Test a TCP connection to a target and port without sending application data.",
+            object_schema(
+                json!({"target":target_property(),"port":{"type":"integer","minimum":1,"maximum":65535},"timeout_ms":{"type":"integer","minimum":100,"maximum":8000}}),
+                &["target", "port"],
+            ),
+        ),
+        (
+            "network.http_probe",
+            "Fetch bounded HTTP response headers, redirects, and timing using fixed curl arguments.",
+            object_schema(
+                json!({"url":{"type":"string","minLength":8,"maxLength":2048,"pattern":"^https?://"}}),
+                &["url"],
+            ),
+        ),
+        (
+            "network.tls_inspect",
+            "Inspect the TLS handshake and peer certificate using fixed OpenSSL arguments.",
+            object_schema(
+                json!({"target":target_property(),"port":{"type":"integer","minimum":1,"maximum":65535}}),
+                &["target"],
+            ),
+        ),
+        (
+            "network.traceroute",
+            "Run a bounded traceroute with a strict hop limit.",
+            target_schema_with(json!({"max_hops":{"type":"integer","minimum":1,"maximum":20}})),
+        ),
+        (
+            "system.processes",
+            "List bounded local process metadata without environment variables or command arguments.",
+            object_schema(json!({}), &[]),
+        ),
+        (
+            "system.connections",
+            "List bounded local network connection ownership using fixed lsof arguments.",
+            object_schema(json!({}), &[]),
+        ),
+        (
+            "system.dns_config",
+            "Inspect the local DNS resolver configuration.",
+            object_schema(json!({}), &[]),
+        ),
+        (
+            "system.proxy_config",
+            "Inspect the operating system proxy configuration without reading environment variables.",
+            object_schema(json!({}), &[]),
+        ),
+        (
+            "system.route_lookup",
+            "Look up the local route, gateway, and interface selected for one target.",
+            object_schema(json!({"target":target_property()}), &["target"]),
+        ),
+        (
+            "system.port_owner",
+            "Find the process owning a local TCP or UDP port using fixed lsof arguments.",
+            object_schema(
+                json!({"port":{"type":"integer","minimum":1,"maximum":65535},"protocol":{"type":"string","enum":["tcp","udp"]}}),
+                &["port"],
+            ),
+        ),
+    ];
+    specs
+        .into_iter()
+        .map(|(id, description, input_schema)| ToolDef {
+            id: id.into(),
+            description: description.into(),
+            input_schema,
+            output_schema: standard_output_schema(),
+            permissions: Vec::new(),
+            risk: "low".into(),
+            timeout_ms: Some(10_000),
+            truncate_at: 36,
+        })
+        .collect()
+}
+
+fn evidence_summary_defs() -> Vec<ToolDef> {
+    let specs = [
+        (
+            "traffic.conversations",
+            "Summarize stored network conversations by endpoint pair and protocol.",
+        ),
+        (
+            "traffic.http_sessions",
+            "Summarize HTTP-like sessions already parsed into stored flow evidence.",
+        ),
+        (
+            "traffic.tls_sessions",
+            "Summarize TLS-like sessions already parsed into stored flow evidence.",
+        ),
+        (
+            "traffic.retransmissions",
+            "Summarize retransmission indicators present in stored flow metadata.",
+        ),
+        (
+            "traffic.bandwidth_summary",
+            "Rank stored flows by bounded byte and packet totals.",
+        ),
+        (
+            "traffic.extract_iocs",
+            "Extract bounded unique IP addresses and DNS names from stored evidence.",
+        ),
+    ];
+    let mut defs = specs
+        .into_iter()
+        .map(|(id, description)| ToolDef {
+            id: id.into(),
+            description: description.into(),
+            input_schema: list_input_schema(),
+            output_schema: standard_output_schema(),
+            permissions: Vec::new(),
+            risk: "low".into(),
+            timeout_ms: Some(2_000),
+            truncate_at: MAX_LIST_LIMIT,
+        })
+        .collect::<Vec<_>>();
+    defs.push(ToolDef {
+        id: "finding.explain".into(),
+        description: "Return one stored finding with its entities, recommendations, and traceable evidence references.".into(),
+        input_schema: object_schema(json!({"finding_id":{"type":"string","minLength":1}}), &["finding_id"]),
+        output_schema: standard_output_schema(), permissions: Vec::new(), risk: "low".into(),
+        timeout_ms: Some(2_000), truncate_at: 1,
+    });
+    defs
+}
+
+fn target_property() -> Value {
+    json!({"type":"string","minLength":1,"maxLength":253,"pattern":"^[A-Za-z0-9][A-Za-z0-9.:-]*$"})
+}
+
+fn target_schema_with(extra: Value) -> Value {
+    let mut properties = extra.as_object().cloned().unwrap_or_default();
+    properties.insert("target".into(), target_property());
+    object_schema(Value::Object(properties), &["target"])
+}
+
+fn summarize_conversations(
+    input: &Map<String, Value>,
+    store: &SqliteStore,
+) -> Result<ToolResult, String> {
+    let limit = validate_list_input(input)?;
+    let flows = store.list_flows()?;
+    let mut grouped = BTreeMap::<String, (usize, u64, u64)>::new();
+    for flow in &flows {
+        let key = format!(
+            "{}:{} ↔ {}:{} {}",
+            flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port, flow.protocol
+        );
+        let entry = grouped.entry(key).or_default();
+        entry.0 += 1;
+        entry.1 += flow.bytes_in + flow.bytes_out;
+        entry.2 += flow.packets_in + flow.packets_out;
+    }
+    let total = grouped.len();
+    let conversations = grouped.into_iter().take(limit).map(|(conversation, (flows, bytes, packets))| json!({"conversation":conversation,"flows":flows,"bytes":bytes,"packets":packets})).collect::<Vec<_>>();
+    bounded_summary(
+        "Stored conversations",
+        total,
+        limit,
+        "conversations",
+        conversations,
+    )
+}
+
+fn summarize_service_sessions(
+    input: &Map<String, Value>,
+    store: &SqliteStore,
+    kind: &str,
+) -> Result<ToolResult, String> {
+    let limit = validate_list_input(input)?;
+    let matching = store
+        .list_flows()?
+        .into_iter()
+        .filter(|flow| {
+            if kind == "http" {
+                matches!(flow.dst_port, 80 | 8080 | 8000)
+                    || flow.service.to_ascii_lowercase().contains("http")
+                        && !flow.service.to_ascii_lowercase().contains("ssl")
+            } else {
+                matches!(flow.dst_port, 443 | 8443)
+                    || ["tls", "ssl", "https"]
+                        .iter()
+                        .any(|value| flow.service.to_ascii_lowercase().contains(value))
+            }
+        })
+        .collect::<Vec<_>>();
+    let total = matching.len();
+    let sessions = matching.into_iter().take(limit).collect::<Vec<_>>();
+    bounded_summary(
+        &format!("Stored {kind} sessions"),
+        total,
+        limit,
+        "sessions",
+        sessions,
+    )
+}
+
+fn summarize_retransmissions(
+    input: &Map<String, Value>,
+    store: &SqliteStore,
+) -> Result<ToolResult, String> {
+    let limit = validate_list_input(input)?;
+    let matching = store
+        .list_flows()?
+        .into_iter()
+        .filter(|flow| {
+            flow.metadata
+                .get("retransmissions")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0
+                || flow
+                    .metadata
+                    .get("tcp_retransmission")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    let total = matching.len();
+    let flows = matching.into_iter().take(limit).collect::<Vec<_>>();
+    bounded_summary(
+        "Stored retransmission indicators",
+        total,
+        limit,
+        "flows",
+        flows,
+    )
+}
+
+fn summarize_bandwidth(
+    input: &Map<String, Value>,
+    store: &SqliteStore,
+) -> Result<ToolResult, String> {
+    let limit = validate_list_input(input)?;
+    let mut flows = store.list_flows()?;
+    flows.sort_by_key(|flow| std::cmp::Reverse(flow.bytes_in + flow.bytes_out));
+    let total = flows.len();
+    let rows = flows.into_iter().take(limit).map(|flow| json!({"flow_id":flow.id,"src_ip":flow.src_ip,"dst_ip":flow.dst_ip,"protocol":flow.protocol,"bytes":flow.bytes_in+flow.bytes_out,"packets":flow.packets_in+flow.packets_out})).collect::<Vec<_>>();
+    bounded_summary("Stored bandwidth summary", total, limit, "flows", rows)
+}
+
+fn summarize_iocs(input: &Map<String, Value>, store: &SqliteStore) -> Result<ToolResult, String> {
+    let limit = validate_list_input(input)?;
+    let flows = store.list_flows()?;
+    let dns = store.list_dns_events()?;
+    let ips = flows
+        .iter()
+        .flat_map(|flow| [&flow.src_ip, &flow.dst_ip])
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let domains = dns
+        .iter()
+        .map(|event| event.query_name.clone())
+        .collect::<BTreeSet<_>>();
+    let total = ips.len() + domains.len();
+    let values = ips
+        .into_iter()
+        .map(|value| json!({"kind":"ip","value":value}))
+        .chain(
+            domains
+                .into_iter()
+                .map(|value| json!({"kind":"domain","value":value})),
+        )
+        .take(limit)
+        .collect::<Vec<_>>();
+    bounded_summary("IOCs from stored evidence", total, limit, "iocs", values)
+}
+
+fn explain_finding(input: &Map<String, Value>, store: &SqliteStore) -> Result<ToolResult, String> {
+    reject_unknown_fields(input, &["finding_id"])?;
+    let id = input
+        .get("finding_id")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .ok_or("finding_id is required")?;
+    let finding = store
+        .list_findings()?
+        .into_iter()
+        .find(|finding| finding.id == id)
+        .ok_or_else(|| format!("finding not found: {id}"))?;
+    Ok(ToolResult {
+        title: format!("Finding: {}", finding.title),
+        summary: finding.description.clone(),
+        structured: json!({"finding":finding,"raw_packets_included":false}),
+        artifacts: Vec::new(),
+        truncated: false,
+        raw_output_artifact: None,
+    })
+}
+
+fn bounded_summary<T: Serialize>(
+    title: &str,
+    total: usize,
+    limit: usize,
+    field: &str,
+    rows: Vec<T>,
+) -> Result<ToolResult, String> {
+    let mut structured = Map::new();
+    structured.insert("total".into(), json!(total));
+    structured.insert("returned".into(), json!(rows.len()));
+    structured.insert(
+        field.into(),
+        serde_json::to_value(&rows).map_err(|e| e.to_string())?,
+    );
+    Ok(ToolResult {
+        title: title.into(),
+        summary: format!(
+            "Found {total} record(s); returned {} with limit {limit}.",
+            rows.len()
+        ),
+        structured: Value::Object(structured),
+        artifacts: Vec::new(),
+        truncated: total > rows.len(),
+        raw_output_artifact: None,
+    })
+}
+
 fn capture_input_schema() -> Value {
     object_schema(
         json!({
@@ -1356,18 +1751,24 @@ mod tests {
             .filter_map(|schema| schema.pointer("/function/name").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 36);
         assert!(names.contains(&"flow_list"));
         assert!(names.contains(&"system_shell"));
         assert!(names.contains(&"artifact_summary"));
         assert!(names.contains(&"capture_start"));
         assert!(names.contains(&"pcap_open"));
+        assert!(names.contains(&"pcap_compare"));
         assert!(names.contains(&"dns_detect_anomalies"));
         assert!(names.contains(&"zeek_process_pcap"));
         assert!(names.contains(&"suricata_process_pcap"));
         assert!(names.contains(&"report_generate"));
         assert!(names.contains(&"ioc_export"));
         assert!(names.contains(&"respond_propose_firewall_rule"));
+        assert!(names.contains(&"network_ping"));
+        assert!(names.contains(&"network_http_probe"));
+        assert!(names.contains(&"system_port_owner"));
+        assert!(names.contains(&"traffic_bandwidth_summary"));
+        assert!(names.contains(&"finding_explain"));
         assert!(!names.contains(&"capture_stop"));
         assert!(!names.contains(&"mock_large_output"));
         assert!(names.iter().all(|name| !name.contains('.')));
