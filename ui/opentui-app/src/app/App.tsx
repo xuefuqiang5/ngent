@@ -416,6 +416,18 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
             <ThreadMessage key={message.id} message={message} />
           ))}
 
+          {state.session.streamingText ? (
+            <ThreadMessage
+              key="chat_streaming"
+              message={{
+                id: "chat_streaming",
+                role: "assistant",
+                status: "sent",
+                content: state.session.streamingText,
+              }}
+            />
+          ) : null}
+
           {workTrace.length > 0 ? (
             <box flexDirection="column" marginTop={1} gap={0}>
               {workTrace.map((item, index) => (
@@ -1081,6 +1093,68 @@ function readPending(payload: unknown): PendingApproval[] {
 
 export function reduceEvent(current: AppState, event: CoreEvent): AppState {
   const next = { ...current, events: [...current.events, event] }
+
+  if (event.method === "agent.text.started") {
+    return {
+      ...next,
+      session: {
+        ...current.session,
+        streamingText: "",
+      },
+    }
+  }
+
+  if (event.method === "agent.text.delta") {
+    const delta = getString(event.params, "delta") ?? ""
+    if (!delta) return next
+    return {
+      ...next,
+      session: {
+        ...current.session,
+        streamingText: (current.session.streamingText ?? "") + delta,
+      },
+    }
+  }
+
+  if (event.method === "agent.text.ended") {
+    return {
+      ...next,
+      session: {
+        ...current.session,
+        streamingText: undefined,
+      },
+    }
+  }
+
+  if (event.method === "message.created") {
+    const message = (event.params as { message?: unknown }).message as
+      | { role?: string; parts?: Array<{ kind?: string; content?: string }> }
+      | undefined
+    if (message?.role === "assistant") {
+      const text = (message.parts ?? [])
+        .filter((part) => part.kind === "text")
+        .map((part) => part.content ?? "")
+        .join("\n")
+      if (!text) return next
+      return {
+        ...next,
+        session: {
+          ...current.session,
+          streamingText: undefined,
+          messages: [
+            ...current.session.messages,
+            {
+              id: nextUiId("chat_assistant"),
+              role: "assistant" as const,
+              status: "sent" as const,
+              content: text,
+            },
+          ],
+        },
+      }
+    }
+    return next
+  }
 
   if (event.method === "permission.asked") {
     const request = (event.params as { request?: PendingApproval }).request

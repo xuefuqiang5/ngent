@@ -1,0 +1,14 @@
+# Builtin DNS analyzer rule (Phase 14 manifest-driven rules).
+id: dns_nxdomain_enumeration
+name: NXDOMAIN enumeration detection
+description: Hosts that queried many distinct names which returned NXDOMAIN, a pattern consistent with domain enumeration
+category: dns_enumeration
+severity: medium
+analyzer: dns_nxdomain_enumeration
+enabled: true
+params:
+  min_nxdomains: 5
+recommended_actions:
+  - Inspect the queried names for DGA or typosquatting
+  - Compare against host baseline
+  - Check related connections to this host

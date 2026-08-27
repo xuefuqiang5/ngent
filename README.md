@@ -25,6 +25,8 @@ export NETAGENT_LLM_API_BASE="https://api.openai.com/v1"
 export NETAGENT_LLM_MODEL="gpt-4.1-mini"
 ```
 
+LLM calls stream over SSE by default (`NETAGENT_LLM_STREAM=0` disables streaming): assistant text appears token-by-token in the TUI while tools still execute through the typed Tool Runtime. `agent.abort` (Ctrl+C-like, sent over stdio) cancels a running turn mid-stream; the turn settles as `aborted` instead of erroring.
+
 The LLM settings are optional. When they are absent, the same typed Tool Runtime is driven by a deterministic local planner, so the complete demo works without an API key.
 
 The Core reads `.env.local` and `.env` from the repository root itself. Both `./scripts/start_netagent_ui.sh` and a direct `bun run start` therefore load the configured model consistently. Set `NETAGENT_LLM_DISABLED=1` only when you explicitly want the offline planner.
@@ -76,6 +78,8 @@ The model/local planner can call 13 typed Phase 13 tools. All are executed by th
 - `report.generate` / `ioc.export` — Markdown evidence report and IOC JSON document artifacts.
 - `respond.propose_firewall_rule` — high-risk proposal/preview only. The Agent pauses, the user must type an exact confirmation phrase (e.g. `BLOCK 10.0.0.8`) in the TUI, and approval creates a traceable proposal artifact (finding id + evidence refs, `executed=false`). The firewall is NEVER modified.
 
+Detection rules are manifest-driven: every `*.yaml` under `rules/builtin/` is loaded at startup and dispatched by `dns.detect_anomalies`. Findings carry `rule_id` metadata, so adding a new detection rule is just a YAML file — no Core changes. See `core.capabilities.rules` for the loaded set.
+
 The Core also exposes session recovery, capture RPCs, and a bounded mock-output RPC; inspect the exact RPC/event list with `core.capabilities`.
 
 For every request, the Agent persists and displays a concise execution brief containing the objective, Observe-mode scope, candidate/selected tools, constraints, success criteria, and whether permission is required. This is a bounded plan summary, not hidden chain-of-thought.
@@ -98,6 +102,9 @@ For deterministic Core-only demos that require no API key and no live-capture pr
                             # -> offline pcap analysis -> finding/report/IOC -> recovery
 ./scripts/demo_phase13.sh   # offline evidence -> high-risk firewall rule proposal with
                             # typed confirmation -> traceable proposal (never executed)
+./scripts/demo_phase14.sh   # manifest-driven analyzer rules -> two attributed findings
+                            # (NXDOMAIN spike + enumeration) from one fixture pcap
+./scripts/demo_phase15.sh   # streaming SSE deltas + mid-turn cancel via a fake provider
 ```
 
 The demo scripts generate their own DNS NXDOMAIN fixture pcap (via `cargo run --example gen_fixture`) inside an isolated temporary database/artifact directory.

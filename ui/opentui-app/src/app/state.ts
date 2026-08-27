@@ -96,6 +96,8 @@ export type SessionState = {
   messages: ChatMessage[]
   lastPrompt: string
   lastAgentResult: string
+  /** Live streaming assistant text while the Core emits agent.text.delta. */
+  streamingText?: string
 }
 
 export type PermissionState = {

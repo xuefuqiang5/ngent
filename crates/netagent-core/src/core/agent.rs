@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::error::Error;
+use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use netagent_models::{
@@ -130,6 +133,7 @@ struct LoopResult {
     stop_reason: Option<String>,
     activities: Vec<AgentToolActivity>,
     pending_permission: Option<AgentPendingPermission>,
+    aborted: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,6 +164,8 @@ struct LlmConfig {
     model: String,
     system_prompt: String,
     timeout_secs: u64,
+    stream: bool,
+    thinking: bool,
 }
 
 #[derive(Debug)]
@@ -269,6 +275,22 @@ impl AgentRuntime {
     where
         F: FnMut(&AgentToolExecutionRequest) -> Result<ToolOutcome, String>,
     {
+        let abort = AtomicBool::new(false);
+        let mut noop = |_: &str| {};
+        self.run_turn_with_tools_streaming(input, tools, &abort, &mut noop, execute_tool)
+    }
+
+    pub fn run_turn_with_tools_streaming<F>(
+        &mut self,
+        input: AgentAskInput,
+        tools: &[Value],
+        abort: &AtomicBool,
+        on_text_delta: &mut dyn FnMut(&str),
+        execute_tool: F,
+    ) -> Result<AgentTurn, String>
+    where
+        F: FnMut(&AgentToolExecutionRequest) -> Result<ToolOutcome, String>,
+    {
         let session_created = input
             .session_id
             .as_ref()
@@ -346,6 +368,8 @@ impl AgentRuntime {
             &mut provider_messages,
             fallback_calls,
             tools,
+            abort,
+            on_text_delta,
             FallbackMode::Plain {
                 input: input.input.as_str(),
             },
@@ -404,7 +428,11 @@ impl AgentRuntime {
             });
         }
 
-        step.status = StepStatus::Completed;
+        step.status = if loop_result.aborted {
+            StepStatus::Aborted
+        } else {
+            StepStatus::Completed
+        };
         record.steps.push(step.clone());
         let assistant_message = self.build_message(
             &session_id,
@@ -457,6 +485,22 @@ impl AgentRuntime {
         &mut self,
         input: AgentResumeInput,
         tools: &[Value],
+        execute_tool: F,
+    ) -> Result<AgentTurn, String>
+    where
+        F: FnMut(&AgentToolExecutionRequest) -> Result<ToolOutcome, String>,
+    {
+        let abort = AtomicBool::new(false);
+        let mut noop = |_: &str| {};
+        self.continue_turn_with_tools_streaming(input, tools, &abort, &mut noop, execute_tool)
+    }
+
+    pub fn continue_turn_with_tools_streaming<F>(
+        &mut self,
+        input: AgentResumeInput,
+        tools: &[Value],
+        abort: &AtomicBool,
+        on_text_delta: &mut dyn FnMut(&str),
         execute_tool: F,
     ) -> Result<AgentTurn, String>
     where
@@ -585,6 +629,12 @@ impl AgentRuntime {
         );
 
         let llm_config = self.llm.clone();
+        record.messages.push(plan_message.clone());
+        record.messages.push(result_message.clone());
+        let resumed_turn_messages = record.messages.clone();
+        // The provider history must include the injected permission outcome
+        // (the tool result for the waiting call) so every assistant tool_calls
+        // message has its matching tool message.
         let mut provider_messages = llm_config.as_ref().map(|config| {
             self.build_provider_history(config, &record.messages, &input.context_summary, &goal_analysis)
         });
@@ -603,10 +653,6 @@ impl AgentRuntime {
         } else {
             Vec::new()
         };
-
-        record.messages.push(plan_message.clone());
-        record.messages.push(result_message.clone());
-        let resumed_turn_messages = record.messages.clone();
 
         let resolved_activity = AgentToolActivity {
             call_message: record.messages[waiting_message_index].clone(),
@@ -640,6 +686,8 @@ impl AgentRuntime {
             &mut provider_messages,
             fallback_calls,
             tools,
+            abort,
+            on_text_delta,
             FallbackMode::Resume {
                 input: original_input.as_str(),
                 outcome: &input.outcome,
@@ -652,6 +700,7 @@ impl AgentRuntime {
             stop_reason,
             mut activities,
             pending_permission,
+            aborted,
         } = loop_result;
         activities.insert(0, resolved_activity);
 
@@ -711,7 +760,11 @@ impl AgentRuntime {
             });
         }
 
-        step.status = StepStatus::Completed;
+        step.status = if aborted {
+            StepStatus::Aborted
+        } else {
+            StepStatus::Completed
+        };
         if let Some(existing) = record
             .steps
             .iter_mut()
@@ -771,6 +824,8 @@ impl AgentRuntime {
         provider_messages: &mut Option<Vec<ChatMessage>>,
         fallback_calls: Vec<ChatToolCall>,
         tools: &[Value],
+        abort: &AtomicBool,
+        on_text_delta: &mut dyn FnMut(&str),
         fallback_mode: FallbackMode<'_>,
         mut execute_tool: F,
     ) -> Result<LoopResult, String>
@@ -784,7 +839,14 @@ impl AgentRuntime {
         let mut fallback_index = 0_usize;
         let mut stop_reason = None;
         let mut pending_permission = None;
+        let mut aborted = false;
         let final_text = loop {
+            if abort.load(Ordering::Relaxed) {
+                let reason = String::from("Agent turn aborted by the user.");
+                stop_reason = Some(reason.clone());
+                aborted = true;
+                break reason;
+            }
             let action = if let (Some(config), Some(messages)) =
                 (llm_config, provider_messages.as_ref())
             {
@@ -797,7 +859,26 @@ impl AgentRuntime {
                     break reason;
                 }
                 model_rounds += 1;
-                Self::complete_with_llm(config, messages, tools)?
+                if config.stream {
+                    match Self::complete_with_llm_streaming(
+                        config,
+                        messages,
+                        tools,
+                        abort,
+                        on_text_delta,
+                    ) {
+                        Ok(action) => action,
+                        Err(message) if message.contains("aborted") => {
+                            let reason = String::from("Agent turn aborted by the user.");
+                            stop_reason = Some(reason.clone());
+                            aborted = true;
+                            break reason;
+                        }
+                        Err(message) => return Err(message),
+                    }
+                } else {
+                    Self::complete_with_llm(config, messages, tools)?
+                }
             } else if fallback_index < fallback_calls.len() {
                 let call = fallback_calls[fallback_index].clone();
                 fallback_index += 1;
@@ -1047,12 +1128,13 @@ impl AgentRuntime {
             stop_reason,
             activities,
             pending_permission,
+            aborted,
         })
     }
 
     pub fn build_agent_response(turn: &AgentTurn) -> Value {
         let mut response = json!({
-            "phase": "phase13",
+            "phase": "phase15",
             "session_created": turn.session_created,
             "session": turn.session_finished,
             "step": turn.step,
@@ -1060,6 +1142,7 @@ impl AgentRuntime {
             "assistant_message": turn.assistant_message,
             "tool_calls": turn.tool_activities.iter().map(|activity| &activity.tool_call).collect::<Vec<_>>(),
             "run_state": turn.final_run_state,
+            "aborted": turn.step.status == StepStatus::Aborted,
             "llm": {
                 "used": turn.llm_used,
                 "model": turn.llm_model,
@@ -1595,6 +1678,8 @@ impl AgentRuntime {
             tool_choice: String::from("auto"),
             parallel_tool_calls: false,
             temperature: 0.2,
+            stream: false,
+            thinking: Self::thinking_control(config),
         };
         let client = Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
@@ -1638,8 +1723,152 @@ impl AgentRuntime {
             .ok_or_else(|| String::from("llm response contained neither content nor tool_calls"))
     }
 
-    fn truncate_chars(value: &str, limit: usize) -> String {
-        let mut characters = value.chars();
+    /// Stream an OpenAI-compatible `chat/completions` request over SSE.
+    /// Content deltas are forwarded through `on_text_delta` as they arrive and
+    /// tool-call fragments are aggregated by index. The `abort` flag is checked
+    /// before every chunk so mid-turn cancellation works.
+    fn complete_with_llm_streaming(
+        config: &LlmConfig,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        abort: &AtomicBool,
+        on_text_delta: &mut dyn FnMut(&str),
+    ) -> Result<ModelAction, String> {
+        let request = ChatCompletionRequest {
+            model: config.model.clone(),
+            messages: messages.to_vec(),
+            tools: tools.to_vec(),
+            tool_choice: String::from("auto"),
+            parallel_tool_calls: false,
+            temperature: 0.2,
+            stream: true,
+            thinking: Self::thinking_control(config),
+        };
+        if std::env::var("NETAGENT_DEBUG_PROVIDER").is_ok() {
+            eprintln!(
+                "DBG provider messages:\n{}",
+                serde_json::to_string_pretty(&request.messages).unwrap_or_default()
+            );
+        }
+        let client = Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs))
+            .build()
+            .map_err(|error| format!("failed to create llm client: {error}"))?;
+        let endpoint = format!("{}/chat/completions", config.api_base.trim_end_matches('/'));
+        let response = client
+            .post(endpoint)
+            .bearer_auth(&config.api_key)
+            .json(&request)
+            .send()
+            .map_err(|error| {
+                let mut chain = format!("llm request failed: {error}");
+                let mut source = error.source();
+                while let Some(cause) = source {
+                    chain.push_str(&format!(": {cause}"));
+                    source = cause.source();
+                }
+                chain
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .unwrap_or_else(|_| String::from("<failed to read llm error body>"));
+            return Err(format!(
+                "llm request returned {status}: {}",
+                Self::truncate_chars(&body, MAX_LLM_ERROR_BODY_CHARS)
+            ));
+        }
+
+        let mut content = String::new();
+        let mut tool_calls: std::collections::BTreeMap<usize, (String, String, String)> =
+            std::collections::BTreeMap::new();
+        let reader = BufReader::new(response);
+        for line in reader.lines() {
+            if abort.load(Ordering::Relaxed) {
+                return Err(String::from("agent turn aborted by the user"));
+            }
+            let line = line.map_err(|error| format!("failed to read llm stream: {error}"))?;
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            if let Some(message) = data.strip_prefix("{\"error\"") {
+                return Err(format!("llm stream error: {}", Self::truncate_chars(message, MAX_LLM_ERROR_BODY_CHARS)));
+            }
+            let chunk: ChatStreamChunk = serde_json::from_str(data)
+                .map_err(|error| format!("failed to parse llm stream chunk: {error}"))?;
+            let Some(delta) = chunk
+                .choices
+                .into_iter()
+                .next()
+                .and_then(|choice| choice.delta)
+            else {
+                continue;
+            };
+            if let Some(delta_content) = delta.content {
+                if !delta_content.is_empty() {
+                    content.push_str(&delta_content);
+                    on_text_delta(&delta_content);
+                }
+            }
+            for tool_call in delta.tool_calls {
+                let index = tool_call.index;
+                let entry = tool_calls
+                    .entry(index)
+                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                if let Some(id) = tool_call.id {
+                    entry.0 = id;
+                }
+                if let Some(function) = tool_call.function {
+                    if let Some(name) = function.name {
+                        if !name.is_empty() {
+                            entry.1.push_str(&name);
+                        }
+                    }
+                    if let Some(arguments) = function.arguments {
+                        entry.2.push_str(&arguments);
+                    }
+                }
+            }
+        }
+
+        if !tool_calls.is_empty() {
+            return Ok(ModelAction::ToolCalls(
+                tool_calls
+                    .into_values()
+                    .map(|(id, name, arguments)| ChatToolCall {
+                        id,
+                        kind: String::from("function"),
+                        function: ChatFunctionCall { name, arguments },
+                    })
+                    .collect(),
+            ));
+        }
+        let trimmed = content.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(String::from(
+                "llm stream ended without content or tool_calls",
+            ));
+        }
+        Ok(ModelAction::Text(trimmed))
+    }
+
+    /// Serialize the provider thinking control. Thinking is disabled unless
+    /// `NETAGENT_LLM_THINKING=1`, which keeps persisted-history rebuilds
+    /// (resume) compatible with DeepSeek's reasoning_content round-trip rule.
+    fn thinking_control(config: &LlmConfig) -> Option<Value> {
+        if config.thinking {
+            None
+        } else {
+            Some(json!({ "type": "disabled" }))
+        }
+    }
+
+    fn truncate_chars(value: &str, limit: usize) -> String {        let mut characters = value.chars();
         let truncated = characters.by_ref().take(limit).collect::<String>();
         if characters.next().is_some() {
             format!("{truncated}…")
@@ -1686,6 +1915,19 @@ impl LlmConfig {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(60)
             .clamp(5, 300);
+        let stream = Self::config_value("NETAGENT_LLM_STREAM")
+            .map(|value| {
+                !matches!(
+                    value.as_str(),
+                    "0" | "false" | "no" | "off" | "disabled"
+                )
+            })
+            .unwrap_or(true);
+        let thinking = Self::config_value("NETAGENT_LLM_THINKING")
+            .map(|value| {
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false);
 
         Some(Self {
             api_base,
@@ -1693,6 +1935,8 @@ impl LlmConfig {
             model,
             system_prompt,
             timeout_secs,
+            stream,
+            thinking,
         })
     }
 
@@ -1738,6 +1982,13 @@ struct ChatCompletionRequest {
     tool_choice: String,
     parallel_tool_calls: bool,
     temperature: f32,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
+    /// DeepSeek-style thinking control. Disabled by default so assistant
+    /// messages (including tool-call rounds) never require passing back
+    /// `reasoning_content` when history is rebuilt from persistence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1851,6 +2102,43 @@ struct ChatCompletionResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct ChatChoice {
     message: ChatAssistantMessage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatStreamChunk {
+    #[serde(default)]
+    choices: Vec<ChatStreamChoice>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatStreamChoice {
+    #[serde(default)]
+    delta: Option<ChatStreamDelta>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ChatStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ChatStreamToolCall>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatStreamToolCall {
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<ChatStreamFunction>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ChatStreamFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1985,6 +2273,8 @@ mod tests {
             model: String::from("test-model"),
             system_prompt: String::from(DEFAULT_SYSTEM_PROMPT),
             timeout_secs: 5,
+            stream: false,
+            thinking: false,
         });
         let tools = vec![json!({
             "type": "function",
@@ -2244,8 +2534,179 @@ mod tests {
     }
 
     #[test]
-    fn repeated_tool_call_guard_stops_the_third_identical_call() {
-        let mut calls = HashMap::new();
+    fn streaming_llm_forwards_deltas_and_aggregates_tool_call_fragments() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
+        let address = listener.local_addr().expect("fake provider address");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            // Round 1: streamed tool-call fragments; round 2 (after the tool
+            // result is fed back) streams the final text answer.
+            for round in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let _ = read_http_body(&mut stream);
+                let chunks: &[&str] = if round == 0 {
+                    &[
+                        r#"data: {"choices":[{"delta":{"role":"assistant","content":"Hel"}}]}"#,
+                        r#"data: {"choices":[{"delta":{"content":"lo from"}}]}"#,
+                        r#"data: {"choices":[{"delta":{"content":" stream"}}]}"#,
+                        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tc_1","function":{"name":"flow_l","arguments":"{\"li"}}]}}]}"#,
+                        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"ist","arguments":"mit\":3}"}}]}}]}"#,
+                        "data: [DONE]",
+                    ]
+                } else {
+                    &[
+                        r#"data: {"choices":[{"delta":{"role":"assistant","content":"Final "}}]}"#,
+                        r#"data: {"choices":[{"delta":{"content":"answer."}}]}"#,
+                        "data: [DONE]",
+                    ]
+                };
+                let body = chunks
+                    .iter()
+                    .map(|chunk| format!("{chunk}\n\n"))
+                    .collect::<String>();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write response");
+                stream.flush().expect("flush chunks");
+            }
+            ready_tx.send(()).expect("signal ready");
+            let _ = finish_rx.recv();
+        });
+
+        let mut runtime = AgentRuntime::disabled();
+        runtime.llm = Some(LlmConfig {
+            api_base: format!("http://{address}/v1"),
+            api_key: String::from("test-key"),
+            model: String::from("test-model"),
+            system_prompt: String::from(DEFAULT_SYSTEM_PROMPT),
+            timeout_secs: 5,
+            stream: true,
+            thinking: false,
+        });
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "flow_list",
+                "description": "List flows",
+                "parameters": { "type": "object" }
+            }
+        })];
+        let mut deltas = Vec::new();
+        let abort = AtomicBool::new(false);
+        let turn = runtime
+            .run_turn_with_tools_streaming(
+                AgentAskInput {
+                    session_id: None,
+                    mode: AgentMode::Observe,
+                    input: String::from("Stream please."),
+                    context_summary: String::from("flows=0"),
+                },
+                &tools,
+                &abort,
+                &mut |delta: &str| deltas.push(delta.to_string()),
+                |request| {
+                    assert_eq!(request.tool_name, "flow.list");
+                    assert_eq!(request.input, json!({ "limit": 3 }));
+                    Ok(ToolOutcome::Completed(ToolResult {
+                        title: String::from("Stored flows"),
+                        summary: String::from("Found 0 stored flow records."),
+                        structured: json!({ "total": 0 }),
+                        artifacts: Vec::new(),
+                        truncated: false,
+                        raw_output_artifact: None,
+                    }))
+                },
+            )
+            .expect("streaming loop");
+        finish_tx.send(()).expect("finish server");
+        server.join().expect("fake provider server");
+
+        assert_eq!(&deltas[..3], &["Hel", "lo from", " stream"]);
+        assert!(deltas.contains(&"Final ".to_string()));
+        assert_eq!(
+            turn.assistant_message.parts[0].content,
+            "Final answer."
+        );
+        assert_eq!(turn.tool_activities.len(), 1);
+        assert_eq!(
+            turn.tool_activities[0].tool_call.input,
+            json!({ "limit": 3 }).to_string()
+        );
+    }
+
+    #[test]
+    fn streaming_llm_stops_early_when_abort_is_requested() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
+        let address = listener.local_addr().expect("fake provider address");
+        let (start_tx, start_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let _ = read_http_body(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+            )
+            .expect("write headers");
+            let event = "data: {\"choices\":[{\"delta\":{\"content\":\"first chunk\"}}]}\n\n";
+            write!(stream, "{:x}\r\n{}\r\n", event.len(), event).expect("write first chunk");
+            stream.flush().expect("flush first chunk");
+            start_tx.send(()).expect("signal first chunk");
+            // Keep the connection open: the client should abort before any
+            // second chunk arrives.
+            let _ = finish_rx.recv();
+        });
+
+        let mut runtime = AgentRuntime::disabled();
+        runtime.llm = Some(LlmConfig {
+            api_base: format!("http://{address}/v1"),
+            api_key: String::from("test-key"),
+            model: String::from("test-model"),
+            system_prompt: String::from(DEFAULT_SYSTEM_PROMPT),
+            timeout_secs: 5,
+            stream: true,
+            thinking: false,
+        });
+        let abort = std::sync::Arc::new(AtomicBool::new(false));
+        let abort_handle = abort.clone();
+        let set_abort = thread::spawn(move || {
+            start_rx.recv().expect("first chunk received");
+            abort_handle.store(true, Ordering::Relaxed);
+        });
+        let result = runtime.run_turn_with_tools_streaming(
+            AgentAskInput {
+                session_id: None,
+                mode: AgentMode::Observe,
+                input: String::from("This will be aborted."),
+                context_summary: String::from("flows=0"),
+            },
+            &[],
+            abort.as_ref(),
+            &mut |_delta: &str| {},
+            |_request| unreachable!("no tool should execute"),
+        );
+        set_abort.join().expect("abort thread");
+        finish_tx.send(()).expect("finish server");
+        server.join().expect("fake provider server");
+
+        let turn = result.expect("aborted turns settle as normal results");
+        assert_eq!(turn.step.status, StepStatus::Aborted);
+        assert_eq!(turn.final_run_state, RunState::Idle);
+        assert_eq!(turn.stop_reason.as_deref(), Some("Agent turn aborted by the user."));
+        assert!(
+            turn.assistant_message.parts[0]
+                .content
+                .contains("aborted")
+        );
+    }
+
+    #[test]
+    fn repeated_tool_call_guard_stops_the_third_identical_call() {        let mut calls = HashMap::new();
         let input = json!({ "limit": 5 });
         assert!(!AgentRuntime::repeated_tool_call_exceeded(
             &mut calls,

@@ -424,12 +424,43 @@ impl SqliteStore {
 
         let mut spikes = Vec::new();
         for row in rows {
-            let entry = row.map_err(|e| format!("failed to read nxdomain row: {e}"))?;
-            if entry.3 >= threshold_ratio {
-                spikes.push(entry);
-            }
+            spikes.push(row.map_err(|e| format!("failed to read nxdomain stats: {e}"))?);
         }
-        Ok(spikes)
+
+        // Keep only hosts whose NXDOMAIN ratio exceeds the threshold.
+        Ok(spikes
+            .into_iter()
+            .filter(|(_, _, _, ratio)| *ratio >= threshold_ratio)
+            .collect())
+    }
+
+    /// Distinct NXDOMAIN query names per source host.
+    pub fn nxdomain_qname_counts_by_host(
+        &self,
+    ) -> Result<Vec<(String, usize, usize)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT src_ip,
+                        COUNT(DISTINCT query_name) AS distinct_names,
+                        COUNT(*) AS nxdomain_responses
+                 FROM dns_events
+                 WHERE response_code_num = 3
+                 GROUP BY src_ip",
+            )
+            .map_err(|e| format!("failed to prepare nxdomain qname stats: {e}"))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| format!("failed to query nxdomain qname stats: {e}"))?;
+
+        let mut hosts = Vec::new();
+        for row in rows {
+            hosts.push(row.map_err(|e| format!("failed to read nxdomain qname stats: {e}"))?);
+        }
+        Ok(hosts)
     }
 
     // ── Findings ──

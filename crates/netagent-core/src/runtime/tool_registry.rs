@@ -2,7 +2,7 @@ use netagent_models::{AgentMode, ArtifactRef};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::analyzers::dns::detect_nxdomain_spike;
+use crate::analyzers::rules::{load_rule_manifests, run_all_rules};
 use crate::reports::markdown::{
     build_evidence_bundle_metadata, build_markdown_report, collect_report_input,
 };
@@ -614,29 +614,49 @@ impl ToolRegistry {
                 let threshold_ratio = object
                     .get("threshold_ratio")
                     .and_then(Value::as_f64)
-                    .unwrap_or(0.3)
-                    .clamp(0.0, 1.0);
-                let min_queries = object
-                    .get("min_queries")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(5)
-                    .clamp(1, 10_000) as usize;
-                let findings = detect_nxdomain_spike(
-                    sqlite_store,
-                    finding_counter,
-                    threshold_ratio,
-                    min_queries,
-                )?;
+                    .map(|value| value.clamp(0.0, 1.0));
+                let min_queries = object.get("min_queries").and_then(Value::as_u64);
+                let mut manifests = load_rule_manifests()?;
+                if let Some(threshold) = threshold_ratio {
+                    if let Some(spike) = manifests
+                        .iter_mut()
+                        .find(|manifest| manifest.id == "dns_nxdomain_spike")
+                    {
+                        spike
+                            .params
+                            .insert("threshold_ratio".to_string(), json!(threshold));
+                    }
+                }
+                if let Some(min) = min_queries {
+                    if let Some(spike) = manifests
+                        .iter_mut()
+                        .find(|manifest| manifest.id == "dns_nxdomain_spike")
+                    {
+                        spike.params.insert("min_queries".to_string(), json!(min));
+                    }
+                }
+                let findings = run_all_rules(&manifests, sqlite_store, finding_counter)?;
+                let rule_ids = manifests
+                    .iter()
+                    .map(|manifest| manifest.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 Ok(ToolResult {
                     title: String::from("DNS anomaly detection"),
                     summary: format!(
-                        "Detected {} finding(s) with NXDOMAIN ratio threshold {threshold_ratio} and min_queries {min_queries}.",
+                        "Ran manifest rule(s) ({rule_ids}); detected {} finding(s).",
                         findings.len()
                     ),
                     structured: json!({
                         "status": "ok",
-                        "threshold_ratio": threshold_ratio,
-                        "min_queries": min_queries,
+                        "rules_ran": manifests
+                            .iter()
+                            .map(|manifest| json!({
+                                "id": manifest.id,
+                                "name": manifest.name,
+                                "severity": manifest.severity,
+                            }))
+                            .collect::<Vec<_>>(),
                         "findings_count": findings.len(),
                         "findings": findings,
                     }),

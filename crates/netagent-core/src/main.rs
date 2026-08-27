@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::analyzers::dns::detect_nxdomain_spike;
+use crate::analyzers::rules::{RuleManifest, load_rule_manifests, run_all_rules};
 use crate::core::agent::{
     AgentAskInput, AgentPendingPermission, AgentResumeInput, AgentRuntime, AgentToolActivity,
     AgentToolExecutionRequest, AgentTurn, SessionRecord, ToolOutcome,
@@ -79,9 +79,14 @@ struct CoreState {
     tool_registry: ToolRegistry,
     artifact_store: ArtifactStore,
     sqlite_store: SqliteStore,
+    rule_manifests: Vec<RuleManifest>,
     capture_job: Option<CaptureJob>,
     pending_capture: Option<PendingCapture>,
     pending_respond: Option<PendingRespond>,
+    agent_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Abort signals forwarded by the stdin reader thread while a streaming
+    /// agent turn is running. Polled inside the streaming delta callback.
+    agent_abort_rx: Option<std::sync::mpsc::Receiver<()>>,
     permission_counter: u64,
     capture_counter: u64,
     tool_counter: u64,
@@ -160,9 +165,6 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
-
     let db_path = resolve_database_path()?;
     let sqlite_store = SqliteStore::open(&db_path).map_err(io::Error::other)?;
 
@@ -172,14 +174,25 @@ fn run() -> io::Result<()> {
         tool_registry: ToolRegistry,
         artifact_store: ArtifactStore::default(),
         sqlite_store,
+        rule_manifests: Vec::new(),
         capture_job: None,
         pending_capture: None,
         pending_respond: None,
+        agent_abort: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        agent_abort_rx: None,
         permission_counter: 0,
         capture_counter: 0,
         tool_counter: 0,
         finding_counter: 0,
     };
+    match load_rule_manifests() {
+        Ok(manifests) => state.rule_manifests = manifests,
+        Err(error) => {
+            return Err(io::Error::other(format!(
+                "failed to load analyzer rule manifests: {error}"
+            )));
+        }
+    }
 
     if let Err(error) = restore_core_counters(&mut state) {
         return Err(io::Error::other(error));
@@ -237,29 +250,72 @@ fn run() -> io::Result<()> {
         }
     }
 
+    // Shared stdout so the stdin reader thread can answer `agent.abort` while
+    // the main thread is inside a streaming agent turn.
+    let stdout = std::sync::Arc::new(std::sync::Mutex::new(io::stdout()));
+    let mut writer = SharedStdout(stdout.clone());
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
+    let (abort_tx, abort_rx) = std::sync::mpsc::channel::<()>();
+    state.agent_abort_rx = Some(abort_rx);
+
+    let stdin_stdout = stdout.clone();
+    let stdin_thread = std::thread::spawn(move || {
+        for line_result in io::stdin().lock().lines() {
+            let Ok(line) = line_result else {
+                break;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            if line.contains("\"agent.abort\"") {
+                // Answer abort requests immediately so a running streaming turn
+                // can be interrupted; the turn loop notices via abort_rx.
+                let id = serde_json::from_str::<RpcRequest>(&line)
+                    .map(|request| request.id)
+                    .unwrap_or(Value::Null);
+                let mut out = stdin_stdout.lock().unwrap_or_else(|poison| poison.into_inner());
+                let _ = serde_json::to_writer(
+                    &mut *out,
+                    &RpcResponse {
+                        jsonrpc: JSON_RPC_VERSION,
+                        id,
+                        result: Some(json!({
+                            "aborted": true,
+                            "run_state": RunState::Canceling,
+                            "message": "Abort accepted; the running agent turn will stop at the next streaming checkpoint."
+                        })),
+                        error: None,
+                    },
+                );
+                let _ = writeln!(out);
+                let _ = out.flush();
+                let _ = abort_tx.send(());
+                continue;
+            }
+            if req_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
     write_message(
-        &mut stdout,
+        &mut writer,
         &RpcNotification {
             jsonrpc: JSON_RPC_VERSION,
             method: "event.core.ready",
             params: json!({
-                "phase": "phase13",
+                "phase": "phase15",
                 "protocol_version": JSON_RPC_VERSION,
-                "message": "NetAgent core ready - Phase 13 respond proposal preview."
+                "message": "NetAgent core ready - Phase 15 streaming LLM with mid-turn cancel."
             }),
         },
     )?;
 
-    for line_result in stdin.lock().lines() {
-        let line = line_result?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
+    for line in req_rx {
         let response = match serde_json::from_str::<RpcRequest>(&line) {
             Ok(request) => {
-                reconcile_capture_state(&mut state, &mut stdout)?;
-                handle_request(request, &mut state, &mut stdout)?
+                reconcile_capture_state(&mut state, &mut writer)?;
+                handle_request(request, &mut state, &mut writer)?
             }
             Err(error) => RpcResponse {
                 jsonrpc: JSON_RPC_VERSION,
@@ -272,10 +328,33 @@ fn run() -> io::Result<()> {
             },
         };
 
-        write_message(&mut stdout, &response)?;
+        write_message(&mut writer, &response)?;
+        // Drain any abort signals that arrived while handling the request so
+        // the next agent turn starts with a clean flag.
+        if let Some(abort_rx) = state.agent_abort_rx.as_ref() {
+            while abort_rx.try_recv().is_ok() {}
+        }
     }
 
+    let _ = stdin_thread.join();
     Ok(())
+}
+
+/// A `Write` adapter over a shared stdout so the stdin reader thread and the
+/// main thread can interleave responses without long-held locks.
+#[derive(Clone)]
+struct SharedStdout(std::sync::Arc<std::sync::Mutex<io::Stdout>>);
+
+impl Write for SharedStdout {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let mut stdout = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        stdout.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut stdout = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        stdout.flush()
+    }
 }
 
 fn resolve_database_path() -> io::Result<PathBuf> {
@@ -317,12 +396,12 @@ fn handle_request<W: Write>(
     let result = match request.method.as_str() {
         "system.ping" => Ok(json!({
             "ok": true,
-            "phase": "phase13",
+            "phase": "phase15",
             "message": "pong"
         })),
         "core.capabilities" => Ok(json!({
             "protocol_version": JSON_RPC_VERSION,
-            "phase": "phase13",
+            "phase": "phase15",
             "methods": [
                 "system.ping",
                 "core.capabilities",
@@ -379,6 +458,7 @@ fn handle_request<W: Write>(
             ],
             "llm": state.agent_runtime.llm_status(),
             "agent_tools": state.tool_registry.agent_defs(),
+            "rules": state.rule_manifests.clone(),
             "persistence": {
                 "enabled": true,
                 "backend": "sqlite",
@@ -424,7 +504,7 @@ fn handle_request<W: Write>(
             let capture_status = capture_status_snapshot(state);
             let tool_schemas = state.tool_registry.openai_tool_schemas();
 
-            let turn = match run_agent_ask_turn(
+            let (turn, streamed_text) = match run_agent_ask_turn(
                 state,
                 AgentAskInput {
                     session_id,
@@ -434,6 +514,7 @@ fn handle_request<W: Write>(
                 },
                 &tool_schemas,
                 &capture_status,
+                writer,
             ) {
                 Ok(turn) => turn,
                 Err(message) => {
@@ -457,7 +538,7 @@ fn handle_request<W: Write>(
                 ));
             }
 
-            emit_agent_turn_events(writer, &turn)?;
+            emit_agent_turn_events(writer, &turn, streamed_text)?;
             let mut result = AgentRuntime::build_agent_response(&turn);
             if let Some(pending) = &turn.pending_permission {
                 match finalize_agent_pending_permission(state, writer, &turn.session_finished.id, pending) {
@@ -517,7 +598,7 @@ fn handle_request<W: Write>(
             let outcome_summary = build_resume_outcome_summary(&payload);
             let capture_status = capture_status_snapshot(state);
             let tool_schemas = state.tool_registry.openai_tool_schemas();
-            let turn = match run_agent_resume_turn(
+            let (turn, streamed_text) = match run_agent_resume_turn(
                 state,
                 AgentResumeInput {
                     session_id: session_id.to_string(),
@@ -528,6 +609,7 @@ fn handle_request<W: Write>(
                 },
                 &tool_schemas,
                 &capture_status,
+                writer,
             ) {
                 Ok(turn) => turn,
                 Err(message) => {
@@ -554,7 +636,7 @@ fn handle_request<W: Write>(
                 ));
             }
 
-            if let Err(error) = emit_resumed_turn_events(writer, &turn) {
+            if let Err(error) = emit_resumed_turn_events(writer, &turn, streamed_text) {
                 return Ok(error_response(
                     request.id,
                     RpcError {
@@ -576,11 +658,14 @@ fn handle_request<W: Write>(
             }
             Ok(result)
         }
-        "agent.abort" => Ok(json!({
-            "aborted": false,
-            "run_state": RunState::Idle,
-            "message": "No long-running agent step is active."
-        })),
+        "agent.abort" => {
+            state.agent_abort.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(json!({
+                "aborted": true,
+                "run_state": RunState::Canceling,
+                "message": "Abort requested; the running agent turn will stop at the next streaming checkpoint."
+            }))
+        }
         "session.list" => handle_session_list(state),
         "session.get" => handle_session_get(state, &request.params),
         "message.list" => handle_message_list(state, &request.params),
@@ -642,7 +727,11 @@ fn required_string_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, Rp
         })
 }
 
-fn emit_agent_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::Result<()> {
+fn emit_agent_turn_events<W: Write>(
+    writer: &mut W,
+    turn: &AgentTurn,
+    streamed_text: bool,
+) -> io::Result<()> {
     if turn.session_created {
         emit_event(
             writer,
@@ -736,6 +825,12 @@ fn emit_agent_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::Res
                 "run_state": RunState::WaitingPermission,
             }),
         )?;
+    } else if streamed_text {
+        emit_event(
+            writer,
+            "message.created",
+            json!({ "message": turn.assistant_message }),
+        )?;
     } else {
         emit_event(
             writer,
@@ -777,7 +872,7 @@ fn emit_agent_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::Res
         json!({
             "step": turn.step,
             "run_state": turn.final_run_state,
-            "phase": "phase13",
+            "phase": "phase15",
             "llm": {
                 "used": turn.llm_used,
                 "model": turn.llm_model,
@@ -878,7 +973,11 @@ fn emit_activity_call_events<W: Write>(
 /// Emit the events for a resumed turn: the injected permission outcome, the
 /// resolved capture call, any new tool calls the revised plan executed, and
 /// the final answer (unless the loop paused on a new permission again).
-fn emit_resumed_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::Result<()> {
+fn emit_resumed_turn_events<W: Write>(
+    writer: &mut W,
+    turn: &AgentTurn,
+    streamed_text: bool,
+) -> io::Result<()> {
     emit_event(
         writer,
         "message.created",
@@ -988,6 +1087,12 @@ fn emit_resumed_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::R
                 "run_state": RunState::WaitingPermission,
             }),
         )?;
+    } else if streamed_text {
+        emit_event(
+            writer,
+            "message.created",
+            json!({ "message": turn.assistant_message }),
+        )?;
     } else {
         emit_event(
             writer,
@@ -1029,7 +1134,7 @@ fn emit_resumed_turn_events<W: Write>(writer: &mut W, turn: &AgentTurn) -> io::R
         json!({
             "step": turn.step,
             "run_state": turn.final_run_state,
-            "phase": "phase13",
+            "phase": "phase15",
             "llm": {
                 "used": turn.llm_used,
                 "model": turn.llm_model,
@@ -1080,6 +1185,7 @@ fn emit_tool_domain_events<W: Write>(
                                 "title": finding.get("title"),
                                 "summary": finding.get("description"),
                                 "evidence": finding.get("evidence"),
+                                "rule_id": finding.pointer("/metadata/rule_id"),
                             }
                         }),
                     )?;
@@ -1303,18 +1409,22 @@ fn build_agent_context_summary(state: &CoreState) -> String {
 }
 
 /// Run one Agent turn (a fresh `agent.ask` or a permission-driven `agent.resume`)
-/// with the Phase 12 typed tool executor. The artifact store and counters are
-/// taken out of `state` for the duration of the loop and written back after.
-fn run_agent_turn_with<F>(
+/// with the Phase 15 typed tool executor and streaming deltas. The artifact
+/// store and counters are taken out of `state` for the duration of the loop and
+/// written back after.
+fn run_agent_turn_with<W: Write, F>(
     state: &mut CoreState,
     tool_schemas: &[Value],
     capture_status: &Value,
+    writer: &mut W,
     run: F,
-) -> Result<AgentTurn, String>
+) -> Result<(AgentTurn, bool), String>
 where
     F: FnOnce(
         &mut AgentRuntime,
         &[Value],
+        &std::sync::atomic::AtomicBool,
+        &mut dyn FnMut(&str),
         &mut dyn FnMut(&AgentToolExecutionRequest) -> Result<ToolOutcome, String>,
     ) -> Result<AgentTurn, String>,
 {
@@ -1328,6 +1438,10 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
+    state.agent_abort.store(false, std::sync::atomic::Ordering::Relaxed);
+    let abort = state.agent_abort.clone();
+    let mut streamed_any = false;
+    let mut streamed_text = false;
 
     let mut executor = |execution: &AgentToolExecutionRequest| {
         run_agent_tool(
@@ -1342,33 +1456,61 @@ where
             execution,
         )
     };
+    let mut on_text_delta = |delta: &str| {
+        if let Some(abort_rx) = state.agent_abort_rx.as_ref() {
+            while abort_rx.try_recv().is_ok() {
+                abort.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        streamed_any = true;
+        streamed_text = true;
+        let _ = emit_event(
+            writer,
+            "agent.text.delta",
+            json!({
+                "session_id": "streaming",
+                "message_id": "streaming",
+                "part_id": "streaming",
+                "delta": delta,
+                "run_state": RunState::Analyzing,
+            }),
+        );
+    };
 
-    let turn = run(&mut state.agent_runtime, tool_schemas, &mut executor)?;
+    let turn = run(
+        &mut state.agent_runtime,
+        tool_schemas,
+        &abort,
+        &mut on_text_delta,
+        &mut executor,
+    )?;
     state.artifact_store = artifact_store;
     state.finding_counter = finding_counter;
     state.tool_counter = tool_id_counter;
-    Ok(turn)
+    Ok((turn, streamed_text))
 }
 
-fn run_agent_ask_turn(
+fn run_agent_ask_turn<W: Write>(
     state: &mut CoreState,
     input: AgentAskInput,
     tool_schemas: &[Value],
     capture_status: &Value,
-) -> Result<AgentTurn, String> {
-    run_agent_turn_with(state, tool_schemas, capture_status, |runtime, tools, executor| {
-        runtime.run_turn_with_tools(input, tools, executor)
+    writer: &mut W,
+) -> Result<(AgentTurn, bool), String> {
+    run_agent_turn_with(state, tool_schemas, capture_status, writer, |runtime, tools, abort, delta, executor| {
+        runtime.run_turn_with_tools_streaming(input, tools, abort, delta, executor)
     })
 }
 
-fn run_agent_resume_turn(
+fn run_agent_resume_turn<W: Write>(
     state: &mut CoreState,
     input: AgentResumeInput,
     tool_schemas: &[Value],
     capture_status: &Value,
-) -> Result<AgentTurn, String> {
-    run_agent_turn_with(state, tool_schemas, capture_status, |runtime, tools, executor| {
-        runtime.continue_turn_with_tools(input, tools, executor)
+    writer: &mut W,
+) -> Result<(AgentTurn, bool), String> {
+    run_agent_turn_with(state, tool_schemas, capture_status, writer, |runtime, tools, abort, delta, executor| {
+        runtime.continue_turn_with_tools_streaming(input, tools, abort, delta, executor)
     })
 }
 
@@ -3136,25 +3278,34 @@ fn handle_dns_detect_anomalies<W: Write>(
     writer: &mut W,
     params: &Value,
 ) -> Result<Value, RpcError> {
-    let threshold_ratio = params
-        .get("threshold_ratio")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.3);
-    let min_queries = params
-        .get("min_queries")
-        .and_then(Value::as_u64)
-        .unwrap_or(5) as usize;
-
-    let findings = detect_nxdomain_spike(
-        &state.sqlite_store,
-        &mut state.finding_counter,
-        threshold_ratio,
-        min_queries,
-    )
-    .map_err(|e| RpcError {
+    let mut manifests = load_rule_manifests().map_err(|message| RpcError {
         code: -32008,
-        message: e,
+        message: format!("failed to load rule manifests: {message}"),
     })?;
+    if let Some(threshold) = params.get("threshold_ratio").and_then(Value::as_f64) {
+        if let Some(spike) = manifests
+            .iter_mut()
+            .find(|manifest| manifest.id == "dns_nxdomain_spike")
+        {
+            spike
+                .params
+                .insert("threshold_ratio".to_string(), json!(threshold.clamp(0.0, 1.0)));
+        }
+    }
+    if let Some(min) = params.get("min_queries").and_then(Value::as_u64) {
+        if let Some(spike) = manifests
+            .iter_mut()
+            .find(|manifest| manifest.id == "dns_nxdomain_spike")
+        {
+            spike.params.insert("min_queries".to_string(), json!(min));
+        }
+    }
+
+    let findings = run_all_rules(&manifests, &state.sqlite_store, &mut state.finding_counter)
+        .map_err(|message| RpcError {
+            code: -32008,
+            message: format!("failed to run analyzer rules: {message}"),
+        })?;
 
     for finding in &findings {
         let _ = emit_event(
@@ -3167,6 +3318,7 @@ fn handle_dns_detect_anomalies<W: Write>(
                     "title": finding.title,
                     "summary": finding.description,
                     "evidence": finding.evidence,
+                    "rule_id": finding.metadata.get("rule_id"),
                 }
             }),
         );
@@ -3353,6 +3505,7 @@ fn write_message<W: Write, T: Serialize>(writer: &mut W, message: &T) -> io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzers::dns::detect_nxdomain_spike;
     use netagent_models::{ArtifactKind, DnsEvent, EvidenceRef};
     use std::process::Command;
 
@@ -3507,9 +3660,12 @@ mod tests {
             tool_registry: ToolRegistry,
             artifact_store: ArtifactStore::default(),
             sqlite_store: SqliteStore::open(db_path).expect("open sqlite store"),
+            rule_manifests: Vec::new(),
             capture_job: None,
             pending_capture: None,
             pending_respond: None,
+            agent_abort: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            agent_abort_rx: None,
             permission_counter: 0,
             capture_counter: 0,
             tool_counter: 0,
@@ -3887,7 +4043,7 @@ mod tests {
             .as_str()
             .expect("session id")
             .to_string();
-        assert_eq!(first["phase"], "phase13");
+        assert_eq!(first["phase"], "phase15");
         assert_eq!(first["session_created"], true);
         assert_eq!(first["llm"]["used"], false);
         assert!(
@@ -3977,7 +4133,7 @@ mod tests {
             json!({ "input": "List stored flows and findings." }),
         );
         let tool_calls = turn["tool_calls"].as_array().expect("tool calls");
-        assert_eq!(turn["phase"], "phase13");
+        assert_eq!(turn["phase"], "phase15");
         assert_eq!(turn["resumed"], false);
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(tool_calls[0]["tool_name"], "flow.list");
@@ -4330,7 +4486,7 @@ mod tests {
             json!({ "input": "请抓包看看当前网络是否有异常流量" }),
         );
 
-        assert_eq!(result["phase"], "phase13");
+        assert_eq!(result["phase"], "phase15");
         assert_eq!(result["run_state"], "waiting_permission");
         assert_eq!(result["capture_proposal"]["status"], "waiting_permission");
         assert_eq!(result["capture_proposal"]["capture"]["duration"], 10);
@@ -4586,7 +4742,13 @@ mod tests {
             result["assistant_message"]["parts"][0]["content"]
                 .as_str()
                 .unwrap()
-                .contains("NXDOMAIN")
+                .contains("dns_nxdomain_spike")
+        );
+        assert!(
+            result["assistant_message"]["parts"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("1 finding(s)")
         );
 
         let _ = std::fs::remove_file(db_path);

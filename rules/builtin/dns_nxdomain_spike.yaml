@@ -1,0 +1,17 @@
+# Builtin DNS analyzer rule (Phase 14 manifest-driven rules).
+# New rules can be added in this directory without changing Core code.
+id: dns_nxdomain_spike
+name: NXDOMAIN spike detection
+description: Hosts with a NXDOMAIN response ratio above the threshold
+category: dns_anomaly
+severity: high
+analyzer: dns_nxdomain_spike
+enabled: true
+params:
+  threshold_ratio: 0.3
+  min_queries: 5
+recommended_actions:
+  - Investigate DNS query patterns for this host
+  - Check for DGA-like domain names
+  - Compare against host baseline
+  - Export evidence report
