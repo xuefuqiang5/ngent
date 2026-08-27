@@ -8,6 +8,12 @@ import {
 } from "./state"
 import {
   applyChatInputKey,
+  formatTuiModelText,
+  removeLastGrapheme,
+  responsiveDensity,
+  sanitizeDisplayText,
+  sanitizePastedText,
+  upsertChatMessage,
   readLatestSession,
   readRestoredChatMessages,
   readRestoredToolEvents,
@@ -77,6 +83,78 @@ describe("App event reducer", () => {
     value = applyChatInputKey(value, key("r", { ctrl: true }))
 
     expect(value).toBe("hi ")
+  })
+
+  test("accepts Chinese IME paste and removes a complete grapheme", () => {
+    expect(sanitizePastedText("你好\r\n网络\u0000")).toBe("你好\n网络")
+    expect(removeLastGrapheme("检查网络🧑‍💻")).toBe("检查网络")
+    expect(removeLastGrapheme("检查")).toBe("检")
+  })
+
+  test("reduces visible history when the terminal is resized", () => {
+    expect(responsiveDensity(120, 40)).toEqual({
+      compact: false,
+      messageLimit: 8,
+      traceLimit: 8,
+    })
+    expect(responsiveDensity(60, 20)).toEqual({
+      compact: true,
+      messageLimit: 4,
+      traceLimit: 3,
+    })
+    expect(responsiveDensity(50, 12)).toEqual({
+      compact: true,
+      messageLimit: 2,
+      traceLimit: 1,
+    })
+  })
+
+  test("upserts the same assistant message delivered by event and RPC", () => {
+    const message = {
+      id: "msg_assistant_0001",
+      role: "assistant" as const,
+      status: "sent" as const,
+      content: "one response",
+    }
+    const once = upsertChatMessage([], message)
+    const twice = upsertChatMessage(once, { ...message, content: "final response" })
+
+    expect(twice).toHaveLength(1)
+    expect(twice[0]?.content).toBe("final response")
+  })
+
+  test("keeps the core message id when committing an assistant event", () => {
+    const state = reduceEvent(readyState(), {
+      method: "message.created",
+      params: {
+        message: {
+          id: "msg_core_0001",
+          role: "assistant",
+          parts: [{ kind: "text", content: "answer" }],
+        },
+      },
+    })
+
+    expect(state.session.messages.at(-1)?.id).toBe("msg_core_0001")
+  })
+
+  test("formats bounded Markdown as safe terminal text", () => {
+    const markdown = [
+      "# 检查结果",
+      "",
+      "- **状态**：正常",
+      "| 项目 | 结果 |",
+      "| --- | --- |",
+      "| DNS | `ok` |",
+      "```sh",
+      "echo safe",
+      "```",
+    ].join("\n")
+
+    expect(formatTuiModelText(markdown, 5)).toBe(
+      "检查结果\n\n• 状态：正常\n项目 · 结果\nDNS · ok\n… output shortened for this view",
+    )
+    expect(sanitizeDisplayText("ok\u001b[31m\ttext")).toBe("ok  text")
   })
 
   test("derives approval mode from pending permission only", () => {

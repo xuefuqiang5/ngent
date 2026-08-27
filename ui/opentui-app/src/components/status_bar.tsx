@@ -13,12 +13,23 @@ export function StatusBar(props: {
   snapshot: DashboardSnapshot
   capture: CaptureState
   pendingCount: number
+  compact?: boolean
 }) {
   const iface =
     props.capture.captureInterface !== "n/a"
       ? props.capture.captureInterface
       : props.snapshot.interfaces[0] ?? "n/a"
   const coreStatus = props.sync.status === "error" ? "error" : props.sync.status
+
+  if (props.compact) {
+    return (
+      <box flexDirection="row" paddingX={1} paddingY={0}>
+        <text fg="#e5e7eb">
+          {`NetAgent · ${coreStatus} · ${props.session.status} · cap:${props.capture.status} · pending:${props.pendingCount}`}
+        </text>
+      </box>
+    )
+  }
 
   return (
     <box

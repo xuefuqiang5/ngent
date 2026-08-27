@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import type { KeyEvent } from "@opentui/core"
-import { useKeyboard, useRenderer } from "@opentui/react"
+import { decodePasteBytes } from "@opentui/core"
+import {
+  useKeyboard,
+  usePaste,
+  useRenderer,
+  useTerminalDimensions,
+} from "@opentui/react"
 import type { CoreEvent } from "../harness/event_router"
 import type { RpcClient } from "../harness/rpc_client"
 import type { StdioTransport } from "../harness/transport"
@@ -34,6 +40,7 @@ type AppProps = {
 
 export function App({ eventRouter, rpc, transport }: AppProps) {
   const renderer = useRenderer()
+  const terminal = useTerminalDimensions()
   const [state, setState] = useState<AppState>(initialState())
   const viewMode = deriveViewMode(state)
   const [confirmInput, setConfirmInput] = useState("")
@@ -153,9 +160,30 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
     }))
   })
 
+  usePaste((event) => {
+    const text = sanitizePastedText(decodePasteBytes(event.bytes))
+    if (!text) return
+
+    if (state.permission.pending[0]?.require_typed_confirmation) {
+      setConfirmInput((current) => current + text)
+      return
+    }
+    if (!canSubmitPrompt(state)) return
+
+    setState((current: AppState) => ({
+      ...current,
+      session: {
+        ...current.session,
+        chatInput: current.session.chatInput + text,
+      },
+    }))
+  })
+
+  const density = responsiveDensity(terminal.width, terminal.height)
+
   const recentMessages = useMemo(
-    () => state.session.messages.slice(-8),
-    [state.session.messages],
+    () => state.session.messages.slice(-density.messageLimit),
+    [state.session.messages, density.messageLimit],
   )
   const workTrace = useMemo(
     () =>
@@ -163,8 +191,8 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
         .map(summarizeCoreEvent)
         .filter(isTraceItem)
         .filter((item) => item.title !== "Tool progress")
-        .slice(-12),
-    [state.events],
+        .slice(-density.traceLimit),
+    [state.events, density.traceLimit],
   )
   const findings = useMemo(() => state.alerts.slice(-3).reverse(), [state.alerts])
 
@@ -180,18 +208,7 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
         rpc.request("system.list_interfaces"),
         rpc.request("permission.list_pending"),
       ])
-      const [captureStatus, sessions] = await Promise.all([
-        rpc.request("capture.status"),
-        rpc.request("session.list"),
-      ])
-      const restoredSession = readLatestSession(sessions)
-      const restoredSnapshot = restoredSession
-        ? await rpc.request("session.get", { session_id: restoredSession.id })
-        : undefined
-      const restoredChat = restoredSession
-        ? readRestoredChatMessages(restoredSnapshot)
-        : undefined
-      const restoredToolEvents = readRestoredToolEvents(restoredSnapshot)
+      const captureStatus = await rpc.request("capture.status")
       const dashboardSnapshot = buildSnapshot(capabilities, interfaces)
 
       setState((current: AppState) => ({
@@ -199,29 +216,27 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
         sync: { status: "ready" },
         dashboard: {
           ...dashboardSnapshot,
-          runState:
-            restoredSession?.run_state ?? dashboardSnapshot.runState,
+          runState: dashboardSnapshot.runState,
         },
         capture: readCaptureSnapshot(captureStatus),
         permission: {
           ...current.permission,
-          pending: readPending(pending),
+          pending: readPending(pending).filter(
+            (request) => request.session_id === current.session.sessionId,
+          ),
         },
         session: {
           ...current.session,
-          sessionId: restoredSession?.id ?? current.session.sessionId,
-          status: restoredSessionStatus(restoredSession),
-          messages: restoredChat
-            ? markSystemMessage(
-                restoredChat,
-                `Restored session ${restoredSession?.id}.`,
-              )
-            : markSystemMessage(
-                current.session.messages,
-                "Core connected. Continue the session or ask a new question.",
-              ),
+          sessionId: current.session.sessionId,
+          status: "idle",
+          messages: markSystemMessage(
+            current.session.sessionId === "n/a" ? current.session.messages : [],
+            current.session.sessionId === "n/a"
+              ? "Core connected. This window will start a new session."
+              : "Core state refreshed. Continue this window's session.",
+          ),
         },
-        events: mergeRestoredToolEvents(restoredToolEvents, current.events),
+        events: current.events,
       }))
     } catch (error) {
       setState((current: AppState) => ({
@@ -289,15 +304,12 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
           status: "idle",
           sessionId: response.session?.id ?? current.session.sessionId,
           lastAgentResult: assistantText ?? JSON.stringify(result),
-          messages: [
-            ...current.session.messages,
-            {
-              id: response.assistant_message?.id ?? nextUiId("chat_assistant"),
-              role: "assistant",
-              status: "sent",
-              content: assistantText ?? JSON.stringify(result),
-            },
-          ],
+          messages: upsertChatMessage(current.session.messages, {
+            id: response.assistant_message?.id ?? nextUiId("chat_assistant"),
+            role: "assistant",
+            status: "sent",
+            content: assistantText ?? JSON.stringify(result),
+          }),
         },
       }))
     } catch (error) {
@@ -401,6 +413,7 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
         snapshot={state.dashboard}
         capture={state.capture}
         pendingCount={state.permission.pending.length}
+        compact={density.compact}
       />
 
       <box
@@ -413,7 +426,11 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
       >
         <box flexDirection="column" flexGrow={1} gap={1}>
           {recentMessages.map((message) => (
-            <ThreadMessage key={message.id} message={message} />
+            <ThreadMessage
+              key={message.id}
+              message={message}
+              lineLimit={density.compact ? 6 : 14}
+            />
           ))}
 
           {state.session.streamingText ? (
@@ -425,6 +442,7 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
                 status: "sent",
                 content: state.session.streamingText,
               }}
+              lineLimit={density.compact ? 6 : 14}
             />
           ) : null}
 
@@ -467,8 +485,8 @@ export function App({ eventRouter, rpc, transport }: AppProps) {
 
 export function applyChatInputKey(value: string, event: KeyEvent): string {
   if (event.ctrl || event.meta) return value
-  if (event.name === "backspace") return value.slice(0, -1)
-  if (event.name === "delete") return value.slice(0, -1)
+  if (event.name === "backspace") return removeLastGrapheme(value)
+  if (event.name === "delete") return removeLastGrapheme(value)
   if (event.name === "space") return `${value} `
   if (event.name === "tab") return `${value}  `
   if (event.name.length === 1) {
@@ -480,6 +498,30 @@ export function applyChatInputKey(value: string, event: KeyEvent): string {
     return `${value}${sequence}`
   }
   return value
+}
+
+export function sanitizePastedText(value: string): string {
+  return value
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+}
+
+export function removeLastGrapheme(value: string): string {
+  if (!value) return value
+  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" })
+  const segments = Array.from(segmenter.segment(value))
+  return segments.slice(0, -1).map((entry) => entry.segment).join("")
+}
+
+export function responsiveDensity(width: number, height: number): {
+  compact: boolean
+  messageLimit: number
+  traceLimit: number
+} {
+  const compact = width < 72 || height < 24
+  if (height < 16) return { compact: true, messageLimit: 2, traceLimit: 1 }
+  if (compact) return { compact: true, messageLimit: 4, traceLimit: 3 }
+  return { compact: false, messageLimit: 8, traceLimit: 8 }
 }
 
 function markSystemMessage(messages: AppState["session"]["messages"], content: string) {
@@ -700,6 +742,7 @@ function normalizeChatRole(role: unknown): ChatMessage["role"] | null {
 
 function ThreadMessage(props: {
   message: AppState["session"]["messages"][number]
+  lineLimit?: number
 }) {
   if (props.message.role === "user") {
     return (
@@ -728,7 +771,9 @@ function ThreadMessage(props: {
 
   return (
     <box flexDirection="column" marginBottom={1}>
-      <text fg="#e2e8f0">{truncate(props.message.content, 420)}</text>
+      <text fg="#e2e8f0">
+        {formatTuiModelText(props.message.content, props.lineLimit ?? 14)}
+      </text>
     </box>
   )
 }
@@ -1111,7 +1156,10 @@ export function reduceEvent(current: AppState, event: CoreEvent): AppState {
       ...next,
       session: {
         ...current.session,
-        streamingText: (current.session.streamingText ?? "") + delta,
+        streamingText: truncate(
+          (current.session.streamingText ?? "") + sanitizeDisplayText(delta),
+          6_000,
+        ),
       },
     }
   }
@@ -1128,7 +1176,11 @@ export function reduceEvent(current: AppState, event: CoreEvent): AppState {
 
   if (event.method === "message.created") {
     const message = (event.params as { message?: unknown }).message as
-      | { role?: string; parts?: Array<{ kind?: string; content?: string }> }
+      | {
+          id?: string
+          role?: string
+          parts?: Array<{ kind?: string; content?: string }>
+        }
       | undefined
     if (message?.role === "assistant") {
       const text = (message.parts ?? [])
@@ -1141,15 +1193,12 @@ export function reduceEvent(current: AppState, event: CoreEvent): AppState {
         session: {
           ...current.session,
           streamingText: undefined,
-          messages: [
-            ...current.session.messages,
-            {
-              id: nextUiId("chat_assistant"),
-              role: "assistant" as const,
-              status: "sent" as const,
-              content: text,
-            },
-          ],
+          messages: upsertChatMessage(current.session.messages, {
+            id: message.id ?? nextUiId("chat_assistant"),
+            role: "assistant" as const,
+            status: "sent" as const,
+            content: text,
+          }),
         },
       }
     }
@@ -1252,4 +1301,73 @@ function severityColor(severity: string): string {
 function truncate(value: string, max: number): string {
   if (value.length <= max) return value
   return `${value.slice(0, max)}...`
+}
+
+export function upsertChatMessage(
+  messages: ChatMessage[],
+  message: ChatMessage,
+): ChatMessage[] {
+  const index = messages.findIndex((candidate) => candidate.id === message.id)
+  if (index < 0) return [...messages, message]
+  const next = [...messages]
+  next[index] = message
+  return next
+}
+
+export function sanitizeDisplayText(value: string): string {
+  return value
+    .replace(/\r\n?/g, "\n")
+    .replace(/\t/g, "  ")
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "")
+}
+
+export function formatTuiModelText(value: string, maxLines = 14): string {
+  const source = sanitizeDisplayText(value)
+  const lines: string[] = []
+  let inFence = false
+
+  for (const rawLine of source.split("\n")) {
+    const trimmed = rawLine.trim()
+    if (/^```/.test(trimmed)) {
+      inFence = !inFence
+      continue
+    }
+    if (/^\|?(?:\s*:?-{3,}:?\s*\|)+\s*$/.test(trimmed)) continue
+
+    let line = rawLine
+      .replace(/^\s{0,3}#{1,6}\s+/, "")
+      .replace(/^\s*>\s?/, "")
+      .replace(/^\s*[-*+]\s+/, "• ")
+      .replace(/^\s*(\d+)\.\s+/, "$1. ")
+    line = stripInlineMarkdown(line)
+
+    if (trimmed.startsWith("|") && trimmed.endsWith("|")) {
+      line = trimmed
+        .slice(1, -1)
+        .split("|")
+        .map((cell) => stripInlineMarkdown(cell.trim()))
+        .join(" · ")
+    } else if (inFence && line.length > 0) {
+      line = `  ${line}`
+    }
+    lines.push(line.replace(/[ \t]+$/g, ""))
+  }
+
+  const compacted = lines.filter(
+    (line, index) => line.length > 0 || lines[index - 1]?.length !== 0,
+  )
+  if (compacted.length <= maxLines) return compacted.join("\n")
+  return `${compacted.slice(0, maxLines).join("\n")}\n… output shortened for this view`
+}
+
+function stripInlineMarkdown(value: string): string {
+  return value
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 ($2)")
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "$1")
+    .replace(/(?<!_)_([^_\n]+)_(?!_)/g, "$1")
+    .replace(/~~(.*?)~~/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
 }

@@ -180,6 +180,11 @@ impl SqliteStore {
             "updated_at",
             "TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'",
         )?;
+        self.ensure_column(
+            "steps",
+            "updated_at",
+            "TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'",
+        )?;
         self.backfill_message_parts()
     }
 
@@ -1257,4 +1262,48 @@ fn insert_message_parts_on(
         .map_err(|e| format!("failed to insert message part: {e}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SqliteStore;
+    use rusqlite::Connection;
+
+    #[test]
+    fn migrates_legacy_steps_table_with_updated_at() {
+        let path = std::env::temp_dir().join(format!(
+            "netagent-legacy-steps-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let connection = Connection::open(&path).expect("open legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE steps (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );",
+            )
+            .expect("create legacy steps table");
+        drop(connection);
+
+        let store = SqliteStore::open(&path).expect("migrate database");
+        let has_updated_at = store
+            .conn
+            .prepare("PRAGMA table_info(steps)")
+            .expect("inspect steps")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query columns")
+            .filter_map(Result::ok)
+            .any(|column| column == "updated_at");
+        assert!(has_updated_at);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
 }

@@ -8,7 +8,7 @@ use crate::reports::markdown::{
 };
 use crate::storage::artifact_store::ArtifactStore;
 use crate::storage::sqlite::SqliteStore;
-use crate::tools::tshark;
+use crate::tools::{system_shell, tshark};
 
 const DEFAULT_LIST_LIMIT: usize = 12;
 const MAX_LIST_LIMIT: usize = 25;
@@ -105,9 +105,10 @@ impl ToolRegistry {
         tools
     }
 
-    /// Tools the Agent (LLM or deterministic planner) may call. Phase 13 set:
-    /// Phase 12 tools plus `respond.propose_firewall_rule` (preview only, never
-    /// executes pfctl). `capture.stop` and `mock.large_output` are excluded.
+    /// Tools the Agent (LLM or deterministic planner) may call. The Phase 17
+    /// set adds allowlisted read-only local inspection to the earlier analysis,
+    /// capture, and response-planning tools. `capture.stop` and
+    /// `mock.large_output` remain excluded.
     pub fn agent_defs(&self) -> Vec<ToolDef> {
         let mut tools = self.readonly_defs();
         tools.push(ToolDef {
@@ -175,6 +176,18 @@ impl ToolRegistry {
                 risk: String::from("low"),
                 timeout_ms: Some(1_000),
                 truncate_at: 1,
+            },
+            ToolDef {
+                id: String::from("system.shell"),
+                description: String::from(
+                    "Inspect missing local system facts through a read-only allowlist. Choose one operation: interfaces, routes, listeners, tool_versions, capture_preflight, or system_info. Core selects fixed executable paths and arguments; arbitrary commands, shell syntax, pipes, redirection, environment reads, and file changes are impossible. Use this before guessing local interfaces, capture readiness, routes, listeners, OS details, or installed network tools.",
+                ),
+                input_schema: system_shell_input_schema(),
+                output_schema: standard_output_schema(),
+                permissions: Vec::new(),
+                risk: String::from("low"),
+                timeout_ms: Some(10_000),
+                truncate_at: 36,
             },
             ToolDef {
                 id: String::from("artifact.list"),
@@ -347,7 +360,7 @@ impl ToolRegistry {
         tool_name: &str,
         input: &Value,
         sqlite_store: &SqliteStore,
-        artifact_store: &ArtifactStore,
+        artifact_store: &mut ArtifactStore,
         capture_status: &Value,
     ) -> Result<ToolResult, String> {
         validate_context(context)?;
@@ -415,6 +428,7 @@ impl ToolRegistry {
                     raw_output_artifact: None,
                 })
             }
+            "system.shell" => system_shell::run(object, artifact_store),
             "artifact.list" => {
                 let limit = validate_list_input(object)?;
                 let artifacts = artifact_store.list_artifacts();
@@ -463,7 +477,7 @@ impl ToolRegistry {
                 })
             }
             _ => Err(format!(
-                "tool is not registered in the Phase 11 read-only allowlist: {tool_name}"
+                "tool is not registered in the Agent read-only allowlist: {tool_name}"
             )),
         }
     }
@@ -909,7 +923,7 @@ fn validate_context(context: &ToolContext) -> Result<(), String> {
     }
     if context.permission.required || context.permission.decision != "not_required" {
         return Err(String::from(
-            "Phase 12 agent tools require permission context decision=not_required (capture.start resolves its own permission)",
+            "Agent tools require permission context decision=not_required (permission-gated tools resolve their own permission)",
         ));
     }
     Ok(())
@@ -1086,6 +1100,26 @@ fn capture_input_schema() -> Value {
     )
 }
 
+fn system_shell_input_schema() -> Value {
+    object_schema(
+        json!({
+            "operation": {
+                "type": "string",
+                "enum": system_shell::OPERATIONS,
+                "description": "Read-only inspection operation selected by the Agent"
+            },
+            "interface": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9._:-]+$",
+                "description": "Required only for capture_preflight; never evaluated as shell text"
+            }
+        }),
+        &["operation"],
+    )
+}
+
 fn pcap_path_schema() -> Value {
     object_schema(
         json!({
@@ -1164,7 +1198,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openai_schemas_expose_phase13_agent_tools_but_not_capture_stop_or_mock() {
+    fn openai_schemas_expose_agent_tools_but_not_capture_stop_or_mock() {
         let registry = ToolRegistry;
         let schemas = registry.openai_tool_schemas();
         let names = schemas
@@ -1172,8 +1206,9 @@ mod tests {
             .filter_map(|schema| schema.pointer("/function/name").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 14);
         assert!(names.contains(&"flow_list"));
+        assert!(names.contains(&"system_shell"));
         assert!(names.contains(&"artifact_summary"));
         assert!(names.contains(&"capture_start"));
         assert!(names.contains(&"pcap_open"));
@@ -1184,6 +1219,27 @@ mod tests {
         assert!(!names.contains(&"capture_stop"));
         assert!(!names.contains(&"mock_large_output"));
         assert!(names.iter().all(|name| !name.contains('.')));
+    }
+
+    #[test]
+    fn system_shell_schema_has_no_freeform_command_field() {
+        let registry = ToolRegistry;
+        let tool = registry
+            .agent_defs()
+            .into_iter()
+            .find(|tool| tool.id == "system.shell")
+            .expect("system.shell def");
+        assert_eq!(tool.risk, "low");
+        assert!(tool.permissions.is_empty());
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert!(tool.input_schema["properties"].get("command").is_none());
+        assert!(tool.input_schema["properties"].get("args").is_none());
+        assert_eq!(
+            tool.input_schema["properties"]["operation"]["enum"]
+                .as_array()
+                .map(Vec::len),
+            Some(system_shell::OPERATIONS.len())
+        );
     }
 
     #[test]

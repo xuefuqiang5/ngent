@@ -353,9 +353,9 @@ fn run() -> io::Result<()> {
             jsonrpc: JSON_RPC_VERSION,
             method: "event.core.ready",
             params: json!({
-                "phase": "phase16",
+                "phase": "phase17",
                 "protocol_version": JSON_RPC_VERSION,
-                "message": "NetAgent core ready - Phase 16 concurrent request handling."
+                "message": "NetAgent core ready - Phase 17 production hardening in progress."
             }),
         },
     )?;
@@ -995,11 +995,6 @@ fn emit_agent_turn_events<W: Write>(
     } else {
         emit_event(
             writer,
-            "message.created",
-            json!({ "message": turn.assistant_message }),
-        )?;
-        emit_event(
-            writer,
             "agent.text.started",
             json!({
                 "session_id": turn.session_started.id,
@@ -1025,6 +1020,11 @@ fn emit_agent_turn_events<W: Write>(
                 "message_id": turn.assistant_message.id,
                 "part_id": turn.assistant_message.parts[0].id,
             }),
+        )?;
+        emit_event(
+            writer,
+            "message.created",
+            json!({ "message": turn.assistant_message }),
         )?;
     }
     emit_event(
@@ -4343,9 +4343,15 @@ mod tests {
             }),
         );
         assert_eq!(second["session_created"], false);
-        assert_eq!(second["assistant_message"]["id"], "msg_0014");
-        assert_eq!(second["assistant_message"]["parts"][0]["id"], "part_0014");
-        assert_eq!(second["step"]["id"], "step_0002");
+        assert!(second["assistant_message"]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_") && id.ends_with("_0014")));
+        assert!(second["assistant_message"]["parts"][0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("part_") && id.ends_with("_0014")));
+        assert!(second["step"]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("step_") && id.ends_with("_0002")));
 
         let (messages, _) = call_rpc(
             &mut restored,
@@ -4367,7 +4373,7 @@ mod tests {
             &mut state,
             1,
             "agent.ask",
-            json!({ "input": "请抓包看看当前网络是否有异常流量" }),
+            json!({ "input": "请在已确认接口 en0 抓包看看当前网络是否有异常流量" }),
         );
         let session_id = proposal["session"]["id"]
             .as_str()
@@ -4591,7 +4597,7 @@ mod tests {
             &mut state,
             1,
             "agent.ask",
-            json!({ "input": "请抓包看看当前网络是否有异常流量" }),
+            json!({ "input": "请在已确认接口 en0 抓包看看当前网络是否有异常流量" }),
         );
 
         assert_eq!(result["phase"], "phase15");
@@ -4635,7 +4641,7 @@ mod tests {
             &mut state,
             1,
             "agent.ask",
-            json!({ "input": "请实时抓包分析当前网络是否存在 DNS 异常" }),
+            json!({ "input": "请在已确认接口 en0 实时抓包分析当前网络是否存在 DNS 异常" }),
         );
         assert_eq!(proposal["run_state"], "waiting_permission");
         let session_id = proposal["session"]["id"]
@@ -4752,7 +4758,7 @@ mod tests {
             &mut state,
             1,
             "agent.ask",
-            json!({ "input": "请抓包分析当前网络" }),
+            json!({ "input": "请在已确认接口 en0 抓包分析当前网络" }),
         );
         assert_eq!(proposal["run_state"], "waiting_permission");
         let session_id = proposal["session"]["id"]

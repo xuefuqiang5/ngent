@@ -17,6 +17,8 @@ use crate::runtime::tool_registry::ToolResult;
 const DEFAULT_MAX_STEPS: u32 = 8;
 const MAX_REPEATED_TOOL_CALLS: u32 = 2;
 const MAX_LLM_ERROR_BODY_CHARS: usize = 2_000;
+const MAX_LLM_OUTPUT_CHARS: usize = 6_000;
+const MAX_LLM_OUTPUT_TOKENS: u32 = 800;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are NetAgent, a network investigation assistant. \
 Use the supplied typed tools when evidence is needed. Answer concisely, stay grounded in \
 tool results, and do not invent packet evidence. If evidence is missing, say what is known and \
@@ -25,6 +27,16 @@ When you call capture.start, the Core pauses the loop and asks the user for expl
 do not assume the capture ran until a later tool result says so. If approval is rejected, revise \
 the plan (shorter duration, narrower filter, or offline pcap analysis) instead of retrying \
 unchanged.";
+const TUI_PRESENTATION_PROMPT: &str = "TUI presentation contract: return concise plain text. \
+Use short paragraphs and simple bullets only. Do not emit Markdown headings, tables, HTML, \
+fenced code blocks, or ANSI/control sequences. Keep the final answer within 12 short lines \
+unless the user explicitly requests a longer artifact; put long reports in artifacts.";
+const LOCAL_TOOL_POLICY_PROMPT: &str = "Local evidence policy: when the request depends on \
+missing facts about local interfaces, routes, listening sockets, network tool availability, \
+capture readiness, or operating-system details, call system.shell before guessing or asking the \
+user to discover those facts manually. system.shell is not a general shell: select only one of \
+its allowlisted read-only operations and never request command text. Before capture.start, inspect \
+interfaces or run capture_preflight unless the user already supplied a confirmed interface.";
 
 #[derive(Debug, Clone)]
 pub struct AgentTurn {
@@ -170,12 +182,19 @@ struct LlmConfig {
 
 #[derive(Debug)]
 pub struct AgentRuntime {
+    id_namespace: String,
     session_counter: u64,
     message_counter: u64,
     part_counter: u64,
     step_counter: u64,
     sessions: HashMap<String, SessionRecord>,
     llm: Option<LlmConfig>,
+}
+
+fn next_runtime_namespace() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    format!("{}x{sequence}", std::process::id())
 }
 
 impl Default for AgentRuntime {
@@ -194,6 +213,7 @@ impl AgentRuntime {
 
     pub fn disabled() -> Self {
         Self {
+            id_namespace: next_runtime_namespace(),
             session_counter: 0,
             message_counter: 0,
             part_counter: 0,
@@ -298,7 +318,9 @@ impl AgentRuntime {
             .unwrap_or(true);
         let session_id = input
             .session_id
-            .unwrap_or_else(|| Self::next_id("ses", &mut self.session_counter));
+            .unwrap_or_else(|| {
+                Self::next_id("ses", &self.id_namespace, &mut self.session_counter)
+            });
 
         let mut record = self
             .sessions
@@ -328,7 +350,7 @@ impl AgentRuntime {
         record.messages.push(user_message.clone());
 
         let mut step = Step {
-            id: Self::next_id("step", &mut self.step_counter),
+            id: Self::next_id("step", &self.id_namespace, &mut self.step_counter),
             session_id: session_id.clone(),
             status: StepStatus::Running,
             attempt: 1,
@@ -941,8 +963,16 @@ impl AgentRuntime {
                         }
 
                         total_calls += 1;
-                        let call_message_id = Self::next_id("msg", &mut self.message_counter);
-                        let call_part_id = Self::next_id("part", &mut self.part_counter);
+                        let call_message_id = Self::next_id(
+                            "msg",
+                            &self.id_namespace,
+                            &mut self.message_counter,
+                        );
+                        let call_part_id = Self::next_id(
+                            "part",
+                            &self.id_namespace,
+                            &mut self.part_counter,
+                        );
                         let call_id = format!("call_{}_{}", call_id_prefix, total_calls);
                         let request = AgentToolExecutionRequest {
                             session_id: record.session.id.clone(),
@@ -1172,11 +1202,11 @@ impl AgentRuntime {
         content: String,
     ) -> Message {
         Message {
-            id: Self::next_id("msg", &mut self.message_counter),
+            id: Self::next_id("msg", &self.id_namespace, &mut self.message_counter),
             session_id: session_id.to_string(),
             role,
             parts: vec![MessagePart {
-                id: Self::next_id("part", &mut self.part_counter),
+                id: Self::next_id("part", &self.id_namespace, &mut self.part_counter),
                 kind,
                 content,
             }],
@@ -1211,6 +1241,7 @@ impl AgentRuntime {
             constraints: vec![
                 String::from("Observe mode"),
                 String::from("No arbitrary shell or direct system command execution"),
+                String::from("system.shell permits allowlisted read-only local inspection only"),
                 String::from("Only bounded summaries, structured output, and ArtifactRef values"),
                 String::from("capture.start pauses for explicit user approval"),
                 String::from("State uncertainty when stored evidence is missing"),
@@ -1276,13 +1307,36 @@ impl AgentRuntime {
             }
         }
 
+        if Self::wants_live_evidence(&lower, input)
+            && (Self::contains_any(&lower, &["confirmed interface", "verified interface"])
+                || Self::contains_any(input, &["已确认接口", "确认过的接口"]))
+        {
+            if let Some(interface) = Self::extract_interface_name(input) {
+                return Self::fallback_plan_from_pairs(
+                    step_id,
+                    vec![(
+                        "capture.start",
+                        json!({ "interface": interface, "filter": "tcp or dns", "duration": 10 }),
+                    )],
+                );
+            }
+        }
+
+        if let Some((operation, interface)) = Self::system_inspection_request(&lower, input) {
+            let mut arguments = json!({ "operation": operation });
+            if let Some(interface) = interface {
+                arguments["interface"] = json!(interface);
+            }
+            return Self::fallback_plan_from_pairs(
+                step_id,
+                vec![("system.shell", arguments)],
+            );
+        }
+
         if Self::wants_live_evidence(&lower, input) {
             return Self::fallback_plan_from_pairs(
                 step_id,
-                vec![(
-                    "capture.start",
-                    json!({ "interface": "mock1", "filter": "tcp or dns", "duration": 10 }),
-                )],
+                vec![("system.shell", json!({ "operation": "interfaces" }))],
             );
         }
 
@@ -1499,6 +1553,65 @@ impl AgentRuntime {
         )
     }
 
+    fn system_inspection_request(lower: &str, input: &str) -> Option<(&'static str, Option<String>)> {
+        if Self::contains_any(
+            lower,
+            &["capture preflight", "capture permission", "capture readiness"],
+        ) || Self::contains_any(input, &["抓包预检", "抓包权限", "抓包条件", "能否抓包"])
+        {
+            return match Self::extract_interface_name(input) {
+                Some(interface) => Some(("capture_preflight", Some(interface))),
+                None => Some(("interfaces", None)),
+            };
+        }
+        if Self::contains_any(
+            lower,
+            &["interface", "network adapter", "network device", "网卡", "网络接口"],
+        ) || Self::contains_any(input, &["网卡", "网络接口"])
+        {
+            return Some(("interfaces", None));
+        }
+        if Self::contains_any(lower, &["route", "gateway", "routing table"])
+            || Self::contains_any(input, &["路由", "网关"])
+        {
+            return Some(("routes", None));
+        }
+        if Self::contains_any(lower, &["listener", "listening port", "open port"])
+            || Self::contains_any(input, &["监听端口", "本地端口", "开放端口"])
+        {
+            return Some(("listeners", None));
+        }
+        if Self::contains_any(lower, &["tcpdump version", "tshark version", "tool version"])
+            || Self::contains_any(input, &["工具版本", "是否安装", "安装了吗"])
+        {
+            return Some(("tool_versions", None));
+        }
+        if Self::contains_any(lower, &["system info", "kernel version", "operating system"])
+            || Self::contains_any(input, &["系统信息", "内核版本", "操作系统版本"])
+        {
+            return Some(("system_info", None));
+        }
+        None
+    }
+
+    fn extract_interface_name(input: &str) -> Option<String> {
+        input
+            .split(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '-'))
+            })
+            .find(|token| {
+                !token.is_empty()
+                    && token.len() <= 64
+                    && [
+                        "en", "eth", "wlan", "lo", "utun", "bridge", "bond", "docker", "awdl",
+                    ]
+                    .iter()
+                    .any(|prefix| token.starts_with(prefix))
+                    && token.chars().any(|character| character.is_ascii_digit())
+            })
+            .map(str::to_string)
+    }
+
     fn extract_ip_target(input: &str) -> Option<String> {
         input
             .split(|character: char| {
@@ -1612,6 +1725,7 @@ impl AgentRuntime {
             "finding_list" => String::from("finding.list"),
             "capture_status" => String::from("capture.status"),
             "capture_start" => String::from("capture.start"),
+            "system_shell" => String::from("system.shell"),
             "artifact_list" => String::from("artifact.list"),
             "artifact_summary" => String::from("artifact.summary"),
             "pcap_open" => String::from("pcap.open"),
@@ -1638,6 +1752,8 @@ impl AgentRuntime {
     ) -> Vec<ChatMessage> {
         let mut provider_messages = vec![
             ChatMessage::text("system", config.system_prompt.clone()),
+            ChatMessage::text("system", String::from(TUI_PRESENTATION_PROMPT)),
+            ChatMessage::text("system", String::from(LOCAL_TOOL_POLICY_PROMPT)),
             ChatMessage::text(
                 "system",
                 format!("Current NetAgent structured context:\n{context_summary}"),
@@ -1678,6 +1794,7 @@ impl AgentRuntime {
             tool_choice: String::from("auto"),
             parallel_tool_calls: false,
             temperature: 0.2,
+            max_tokens: MAX_LLM_OUTPUT_TOKENS,
             stream: false,
             thinking: Self::thinking_control(config),
         };
@@ -1717,7 +1834,7 @@ impl AgentRuntime {
         }
         message
             .content
-            .map(|content| content.trim().to_string())
+            .map(|content| Self::truncate_chars(content.trim(), MAX_LLM_OUTPUT_CHARS))
             .filter(|content| !content.is_empty())
             .map(ModelAction::Text)
             .ok_or_else(|| String::from("llm response contained neither content nor tool_calls"))
@@ -1741,6 +1858,7 @@ impl AgentRuntime {
             tool_choice: String::from("auto"),
             parallel_tool_calls: false,
             temperature: 0.2,
+            max_tokens: MAX_LLM_OUTPUT_TOKENS,
             stream: true,
             thinking: Self::thinking_control(config),
         };
@@ -1811,8 +1929,10 @@ impl AgentRuntime {
             };
             if let Some(delta_content) = delta.content {
                 if !delta_content.is_empty() {
-                    content.push_str(&delta_content);
-                    on_text_delta(&delta_content);
+                    let bounded_delta = Self::append_bounded_output(&mut content, &delta_content);
+                    if !bounded_delta.is_empty() {
+                        on_text_delta(&bounded_delta);
+                    }
                 }
             }
             for tool_call in delta.tool_calls {
@@ -1877,9 +1997,19 @@ impl AgentRuntime {
         }
     }
 
-    fn next_id(prefix: &str, counter: &mut u64) -> String {
+    fn append_bounded_output(content: &mut String, delta: &str) -> String {
+        let remaining = MAX_LLM_OUTPUT_CHARS.saturating_sub(content.chars().count());
+        if remaining == 0 {
+            return String::new();
+        }
+        let bounded = delta.chars().take(remaining).collect::<String>();
+        content.push_str(&bounded);
+        bounded
+    }
+
+    fn next_id(prefix: &str, namespace: &str, counter: &mut u64) -> String {
         *counter += 1;
-        format!("{prefix}_{counter:04}")
+        format!("{prefix}_{namespace}_{counter:04}")
     }
 }
 
@@ -1982,6 +2112,7 @@ struct ChatCompletionRequest {
     tool_choice: String,
     parallel_tool_calls: bool,
     temperature: f32,
+    max_tokens: u32,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
     /// DeepSeek-style thinking control. Disabled by default so assistant
@@ -2156,6 +2287,39 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread;
+
+    #[test]
+    fn separate_runtime_instances_generate_distinct_session_and_record_ids() {
+        let mut first = AgentRuntime::disabled();
+        let mut second = AgentRuntime::disabled();
+        let input = || AgentAskInput {
+            session_id: None,
+            mode: AgentMode::Observe,
+            input: String::from("hello"),
+            context_summary: String::new(),
+        };
+
+        let first_turn = first
+            .run_turn_with_tools(input(), &[], |_| unreachable!("no tool expected"))
+            .expect("first turn");
+        let second_turn = second
+            .run_turn_with_tools(input(), &[], |_| unreachable!("no tool expected"))
+            .expect("second turn");
+
+        assert_ne!(first_turn.session_started.id, second_turn.session_started.id);
+        assert_ne!(first_turn.user_message.id, second_turn.user_message.id);
+        assert_ne!(first_turn.step.id, second_turn.step.id);
+    }
+
+    #[test]
+    fn streamed_model_output_is_bounded_before_events_and_persistence() {
+        let mut content = "a".repeat(MAX_LLM_OUTPUT_CHARS - 2);
+        let emitted = AgentRuntime::append_bounded_output(&mut content, "中文extra");
+
+        assert_eq!(emitted, "中文");
+        assert_eq!(content.chars().count(), MAX_LLM_OUTPUT_CHARS);
+        assert!(AgentRuntime::append_bounded_output(&mut content, "ignored").is_empty());
+    }
 
     fn read_http_body(stream: &mut TcpStream) -> String {
         let mut bytes = Vec::new();
@@ -2354,14 +2518,32 @@ mod tests {
     }
 
     #[test]
-    fn fallback_plan_requests_capture_start_for_live_evidence_intent() {
+    fn fallback_plan_inspects_interfaces_before_live_capture() {
         let calls = AgentRuntime::fallback_plan("请实时抓包分析当前网络", "step_0002");
         let names = calls
             .iter()
             .map(|call| call.function.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["capture.start"]);
-        assert!(calls[0].function.arguments.contains("\"duration\":10"));
+        assert_eq!(names, vec!["system.shell"]);
+        assert!(calls[0]
+            .function
+            .arguments
+            .contains("\"operation\":\"interfaces\""));
+    }
+
+    #[test]
+    fn fallback_plan_selects_capture_preflight_for_known_interface() {
+        let calls = AgentRuntime::fallback_plan("检查 en0 的抓包权限", "step_0002b");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "system.shell");
+        assert!(calls[0]
+            .function
+            .arguments
+            .contains("\"operation\":\"capture_preflight\""));
+        assert!(calls[0]
+            .function
+            .arguments
+            .contains("\"interface\":\"en0\""));
     }
 
     #[test]
@@ -2397,7 +2579,7 @@ mod tests {
                 AgentAskInput {
                     session_id: None,
                     mode: AgentMode::Observe,
-                    input: String::from("请抓包分析当前网络"),
+                    input: String::from("请在已确认接口 en0 实时抓包分析当前网络"),
                     context_summary: String::from("flows=0"),
                 },
                 &tools,
@@ -2406,7 +2588,7 @@ mod tests {
                         request_id: String::from("per_0099"),
                         summary: String::from("Waiting for capture approval."),
                         plan: json!({
-                            "interface": "mock1",
+                            "interface": "en0",
                             "filter": "tcp or dns",
                             "duration": 10,
                         }),
@@ -2440,7 +2622,7 @@ mod tests {
                 AgentAskInput {
                     session_id: None,
                     mode: AgentMode::Observe,
-                    input: String::from("请抓包分析当前网络"),
+                    input: String::from("请在已确认接口 en0 实时抓包分析当前网络"),
                     context_summary: String::from("flows=0"),
                 },
                 &tools,
@@ -2448,7 +2630,7 @@ mod tests {
                     Ok(ToolOutcome::PermissionPending {
                         request_id: String::from("per_0001"),
                         summary: String::from("Waiting for capture approval."),
-                        plan: json!({ "interface": "mock1", "filter": "tcp or dns", "duration": 10 }),
+                        plan: json!({ "interface": "en0", "filter": "tcp or dns", "duration": 10 }),
                     })
                 },
             )
@@ -2537,7 +2719,6 @@ mod tests {
     fn streaming_llm_forwards_deltas_and_aggregates_tool_call_fragments() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
         let address = listener.local_addr().expect("fake provider address");
-        let (ready_tx, ready_rx) = mpsc::channel();
         let (finish_tx, finish_rx) = mpsc::channel();
         let server = thread::spawn(move || {
             // Round 1: streamed tool-call fragments; round 2 (after the tool
@@ -2574,7 +2755,6 @@ mod tests {
                 .expect("write response");
                 stream.flush().expect("flush chunks");
             }
-            ready_tx.send(()).expect("signal ready");
             let _ = finish_rx.recv();
         });
 
